@@ -17,13 +17,17 @@ class PplonerPipelinePaths:
     split_manifest_path: Path | None = None
 
 
-def prepare_pploner_paths(source: ResolvedDatasetSource) -> PplonerPipelinePaths:
+def prepare_pploner_paths(
+    source: ResolvedDatasetSource,
+    create_dirs: bool = True,
+) -> PplonerPipelinePaths:
     """Prepare the paths expected by the pploner-style data pipeline."""
 
-    source.tmp_data_dir.mkdir(parents=True, exist_ok=True)
-    source.processed_data_dir.mkdir(parents=True, exist_ok=True)
     manifests_dir = source.processed_data_dir / "manifests"
-    manifests_dir.mkdir(parents=True, exist_ok=True)
+    if create_dirs:
+        source.tmp_data_dir.mkdir(parents=True, exist_ok=True)
+        source.processed_data_dir.mkdir(parents=True, exist_ok=True)
+        manifests_dir.mkdir(parents=True, exist_ok=True)
 
     return PplonerPipelinePaths(
         dataset_dir=source.dataset_dir,
@@ -35,4 +39,3 @@ def prepare_pploner_paths(source: ResolvedDatasetSource) -> PplonerPipelinePaths
 
 
 __all__ = ["PplonerPipelinePaths", "prepare_pploner_paths"]
-

@@ -29,6 +29,7 @@ python scripts/vectorize_collide.py --config configs/paths/local.yaml
 
 ```bash
 pip install datasets huggingface_hub
+jupyter notebook notebooks/00_hf_collide1m_quickstart.ipynb
 python scripts/prepare_collide_source.py --config configs/paths/hf_collide1m.yaml
 python scripts/inspect_dataset.py --config configs/paths/hf_collide1m.yaml
 ```

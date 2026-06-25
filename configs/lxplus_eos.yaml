@@ -1,0 +1,6 @@
+data:
+  backend: eos
+  base_path: /eos/project/f/foundational-model-dataset/samples/production_final
+  max_files: 4
+  max_events: 10000
+

@@ -1,0 +1,15 @@
+paths:
+  dataset_backend: hf
+  hf_dataset_name: fastmachinelearning/collide-1m
+  hf_split: train
+  local_cache_dir: data/hf_cache/collide-1m
+  dataset_dir: data/hf_cache/collide-1m/parquet_export
+  tmp_data_dir: data/tmp
+  processed_data_dir: data/processed/collide1m
+
+data:
+  max_files: 2
+  max_rows: 10000
+  processes: null
+  materialize_local_parquet: true
+

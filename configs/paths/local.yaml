@@ -1,0 +1,12 @@
+paths:
+  dataset_backend: local
+  dataset_dir: data/samples/collide2v_tiny
+  tmp_data_dir: data/tmp
+  processed_data_dir: data/processed/collide2v_tiny
+
+data:
+  max_files: 2
+  max_rows: 10000
+  processes: null
+  materialize_local_parquet: false
+

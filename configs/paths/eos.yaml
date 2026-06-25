@@ -1,0 +1,12 @@
+paths:
+  dataset_backend: eos
+  dataset_dir: /eos/project/f/foundational-model-dataset/samples/production_final
+  tmp_data_dir: /tmp/flowyforge/collide2v
+  processed_data_dir: /eos/user/${USER}/flowyforge/collide2v_processed
+
+data:
+  max_files: 4
+  max_rows: null
+  processes: null
+  materialize_local_parquet: false
+

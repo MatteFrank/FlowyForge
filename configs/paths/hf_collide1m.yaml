@@ -10,6 +10,12 @@ paths:
 data:
   max_files: 2
   max_rows: 10000
+  feature_columns: null
+  label_column: process_id
+  exclude_columns:
+    - event_id
+    - process_name
+    - view
+  output_subdir: vectorized
   processes: null
   materialize_local_parquet: true
-

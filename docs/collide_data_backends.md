@@ -60,3 +60,6 @@ The HF backend must not download the full dataset unless a future explicit confi
 
 Row counts are read from parquet metadata where possible, so manifest generation does not need to load full files into memory.
 
+## Vectorization Status
+
+B1.7 provides minimal pandas-based vectorization for local and HF materialized tiny samples. It writes `X.npy`, optional `y.npy`, feature/label maps, and `vectorization_manifest.json` under `paths.processed_data_dir / data.output_subdir`. Full EOS-scale vectorization is intentionally deferred and guarded by a small `max_files` safety check.

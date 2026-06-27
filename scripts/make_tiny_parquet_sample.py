@@ -38,6 +38,7 @@ def main() -> int:
             raise ValueError("rows-per-file must be positive.")
 
         processes = ["background", "signal"]
+        process_ids = {name: index for index, name in enumerate(processes)}
         written: list[Path] = []
         for index in range(num_files):
             process = processes[index % len(processes)]
@@ -49,8 +50,9 @@ def main() -> int:
                     "event_id": list(range(start, start + args.rows_per_file)),
                     "pt": [20.0 + index + row for row in range(args.rows_per_file)],
                     "eta": [0.1 * row for row in range(args.rows_per_file)],
-                    "label": [index % 2] * args.rows_per_file,
-                    "process": [process] * args.rows_per_file,
+                    "process_id": [process_ids[process]] * args.rows_per_file,
+                    "process_name": [process] * args.rows_per_file,
+                    "view": ["tiny"] * args.rows_per_file,
                 }
             )
             output_path = process_dir / f"sample_{index:03d}.parquet"
@@ -70,4 +72,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

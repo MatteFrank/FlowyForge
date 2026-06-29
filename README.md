@@ -2,7 +2,7 @@
 
 FlowyForge is a modular foundation platform for complex scientific data. The first fast-track path targets COLLIDE-2V / HEP workflows while keeping the package extensible to future datasets, task plugins, model plugins, and analysis tools.
 
-Current status: early skeleton plus COLLIDE parquet-source inspection, manifest preparation, minimal tiny-sample vectorization, preprocessing, and a tiny MLP classification sanity check. It does not access EOS, download full datasets, or implement production ML training yet.
+Current status: early skeleton plus COLLIDE parquet-source inspection, manifest preparation, minimal tiny-sample vectorization, preprocessing, tiny MLP classification training, and basic evaluation/reporting. It does not access EOS, download full datasets, or implement production ML training yet.
 
 ## Install
 
@@ -21,7 +21,7 @@ pytest tests/
 Current fast-track pipeline:
 
 ```text
-Parquet -> inspect/manifest -> vectorize -> preprocess -> tiny training baseline
+Parquet -> inspect/manifest -> vectorize -> preprocess -> train tiny baseline -> evaluate/report
 ```
 
 Current supported backends:
@@ -36,6 +36,8 @@ Docs:
 - [Vectorization](docs/vectorization.md)
 - [Preprocessing](docs/preprocessing.md)
 - [Training](docs/training.md)
+- [Evaluation](docs/evaluation.md)
+- [HF smoke pipeline](docs/hf_smoke_pipeline.md)
 
 ## Smoke Commands
 
@@ -46,6 +48,7 @@ python scripts/inspect_dataset.py --config configs/paths/local.yaml
 python scripts/vectorize_collide.py --config configs/paths/local.yaml
 python scripts/preprocess_collide.py --config configs/paths/local.yaml
 python scripts/train_task.py --config configs/paths/local.yaml --task classification --model mlp
+python scripts/evaluate_task.py --config configs/paths/local.yaml --task classification --model mlp
 ```
 
 ## HF Small Sample
@@ -58,6 +61,19 @@ python scripts/inspect_dataset.py --config configs/paths/hf_collide1m.yaml
 python scripts/vectorize_collide.py --config configs/paths/hf_collide1m.yaml
 python scripts/preprocess_collide.py --config configs/paths/hf_collide1m.yaml
 ```
+
+## HF Smoke Pipeline
+
+```bash
+pip install datasets huggingface_hub
+python scripts/prepare_collide_source.py --config configs/paths/hf_collide1m.yaml
+python scripts/inspect_dataset.py --config configs/paths/hf_collide1m.yaml
+python scripts/vectorize_collide.py --config configs/paths/hf_collide1m.yaml
+python scripts/preprocess_collide.py --config configs/paths/hf_collide1m.yaml
+python scripts/run_hf_smoke_pipeline.py --config configs/paths/hf_collide1m.yaml
+```
+
+If `y.npy` exists, training and evaluation can run. If `y.npy` is absent, the HF smoke pipeline still succeeds as X-only validation.
 
 ## EOS Later On LXPLUS
 

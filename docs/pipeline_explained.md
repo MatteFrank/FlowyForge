@@ -172,6 +172,31 @@ The current model is a tiny PyTorch MLP trained with cross-entropy loss. It writ
 
 This is a pipeline sanity check, not a physics-validated model. Later, training should move more fully through FlowyForge task and model plugins so classification, trigger, masked modeling, calorimeter generation, and foundation-style encoders share a consistent interface.
 
+## Step 6: Evaluation And Reporting
+
+B1.10 adds minimal evaluation and reporting for the tiny MLP classifier.
+
+Command:
+
+```bash
+python scripts/evaluate_task.py --config configs/paths/local.yaml --task classification --model mlp
+```
+
+Evaluation consumes:
+
+- `checkpoint.pt`
+- `X_preprocessed.npy`
+- `y.npy`
+
+It reproduces the train/val/test split from the `training_config` stored in the checkpoint and writes:
+
+- `evaluation_metrics.json`
+- `confusion_matrix.json`
+- `predictions.csv`
+- `evaluation_report.md`
+
+This remains a tiny-sample sanity check. The goal is to prove the pipeline is end-to-end functional, not to claim physics performance.
+
 ## Current Limitations
 
 - Works primarily on local/HF tiny samples.
@@ -180,3 +205,4 @@ This is a pipeline sanity check, not a physics-validated model. Later, training 
 - No graph builder yet.
 - No clean train/val/test split for preprocessing statistics yet.
 - Training is only a tiny MLP classification sanity check.
+- Evaluation reports basic accuracy and confusion matrices only.

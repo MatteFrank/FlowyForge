@@ -2,6 +2,7 @@ paths:
   dataset_backend: hf
   hf_dataset_name: fastmachinelearning/collide-1m
   hf_split: train
+  hf_data_dir: WJetsToLNu_13TeV-madgraphMLM-pythia8
   local_cache_dir: data/hf_cache/collide-1m
   dataset_dir: data/hf_cache/collide-1m/parquet_export
   tmp_data_dir: data/tmp
@@ -9,8 +10,18 @@ paths:
 
 data:
   max_files: 2
-  max_rows: 10000
+  max_rows: 500
+  hf_materialization_mode: summary
+  hf_summary_columns:
+    - FullReco_MET_MET
+    - FullReco_MET_Phi
+    - FullReco_JetAK4_PT
+    - FullReco_Electron_PT
+    - FullReco_MuonTight_PT
+    - L1T_MET_MET
+    - L1T_JetAK4_PT
   feature_columns: null
+  # If this column is absent in the materialized HF sample, vectorization runs X-only.
   label_column: process_id
   exclude_columns:
     - event_id
@@ -41,4 +52,14 @@ training:
   val_fraction: 0.2
   test_fraction: 0.2
   seed: 42
+  device: auto
+
+evaluation:
+  task: classification
+  model: mlp
+  input_subdir: preprocessed
+  training_subdir: training/classification_mlp
+  output_subdir: evaluation/classification_mlp
+  split: test
+  batch_size: 64
   device: auto

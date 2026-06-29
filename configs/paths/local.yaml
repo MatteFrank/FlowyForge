@@ -39,3 +39,13 @@ training:
   test_fraction: 0.2
   seed: 42
   device: auto
+
+evaluation:
+  task: classification
+  model: mlp
+  input_subdir: preprocessed
+  training_subdir: training/classification_mlp
+  output_subdir: evaluation/classification_mlp
+  split: test
+  batch_size: 64
+  device: auto

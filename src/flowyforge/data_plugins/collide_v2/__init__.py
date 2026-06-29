@@ -16,6 +16,10 @@ from flowyforge.data_plugins.collide_v2.pploner_adapter import (
     PplonerPipelinePaths,
     prepare_pploner_paths,
 )
+from flowyforge.data_plugins.collide_v2.pipeline_checks import (
+    collect_pipeline_artifacts,
+    file_exists,
+)
 from flowyforge.data_plugins.collide_v2.preprocessing import (
     PreprocessingConfig,
     PreprocessingResult,
@@ -55,9 +59,11 @@ __all__ = [
     "VectorizationResult",
     "apply_standardization",
     "build_feature_map",
+    "collect_pipeline_artifacts",
     "compute_standardization_stats",
     "create_split_manifest",
     "encode_labels",
+    "file_exists",
     "infer_feature_columns",
     "inspect_dataset_schema",
     "inspect_parquet_schema",

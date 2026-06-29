@@ -40,9 +40,13 @@ def main() -> int:
                 dataset_name=source.hf_dataset_name,
                 split=source.hf_split,
                 output_dir=source.dataset_dir,
-                max_rows=int(data.get("max_rows") or 10000),
-                max_files=int(data.get("max_files") or 2),
+                max_rows=int(data.get("max_rows") or 20),
+                max_files=int(data.get("max_files") or 1),
                 seed=args.seed,
+                data_dir=source.hf_data_dir,
+                data_files=source.hf_data_files,
+                columns=data.get("hf_summary_columns"),
+                materialization_mode=str(data.get("hf_materialization_mode", "summary")),
             )
             source = resolve_dataset_source(config)
 
@@ -69,6 +73,9 @@ def main() -> int:
 
     print(f"Backend: {source.backend}")
     print(f"Dataset dir: {source.dataset_dir}")
+    if source.backend == "hf":
+        print(f"HF data_dir: {source.hf_data_dir or '<all>'}")
+        print(f"HF materialization mode: {data.get('hf_materialization_mode', 'summary')}")
     print(f"Parquet files: {len(source.parquet_files)}")
     print(f"Rows counted: {counts['total_rows']}")
     print(f"File event counts: {pipeline_paths.file_event_counts_path}")
@@ -80,4 +87,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

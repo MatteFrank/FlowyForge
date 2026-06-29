@@ -87,6 +87,14 @@ The default label column is `process_id`. Labels are encoded as `int64` class ID
 
 If the label column is absent, vectorization still succeeds and writes `X.npy` only.
 
+In that case, `vectorization_manifest.json` records the configured label column, all available columns, and the warning:
+
+```text
+Configured label_column was not found; y.npy was not produced.
+```
+
+This behavior is important for Hugging Face smoke samples, where the configured supervised target may not exist in the materialized subset.
+
 ## feature_map.json
 
 `feature_map.json` maps each feature name to its column index in `X.npy`.
@@ -127,4 +135,3 @@ python scripts/preprocess_collide.py --config configs/paths/local.yaml
 ```
 
 Preprocessing standardizes `X.npy`, copies optional labels and maps, and writes metadata under `processed_data_dir/preprocessed/`.
-

@@ -172,12 +172,16 @@ def vectorize_parquet_files(
     if config.max_rows is not None:
         combined = combined.head(config.max_rows)
 
+    available_columns = [str(column) for column in combined.columns]
     x = combined[feature_columns].to_numpy(dtype=np.float32, copy=True)
     y: np.ndarray | None = None
     label_map: dict[str, int] | None = None
     label_column = config.label_column if config.label_column in combined.columns else None
     if label_column is not None:
         y, label_map = encode_labels(combined[label_column])
+    warnings = ["Minimal vectorization for local/HF tiny samples; full EOS-scale vectorization comes later."]
+    if config.label_column is not None and label_column is None:
+        warnings.append("Configured label_column was not found; y.npy was not produced.")
 
     output_path = Path(output_dir).expanduser()
     output_path.mkdir(parents=True, exist_ok=True)
@@ -207,8 +211,11 @@ def vectorize_parquet_files(
         "n_features": int(x.shape[1]),
         "feature_columns": feature_columns,
         "label_column": label_column,
+        "configured_label_column": config.label_column,
+        "available_columns": available_columns,
         "has_labels": y is not None,
-        "warning": "Minimal vectorization for local/HF tiny samples; full EOS-scale vectorization comes later.",
+        "warning": " ".join(warnings),
+        "warnings": warnings,
     }
     _write_json(manifest, manifest_path)
 
@@ -258,4 +265,3 @@ __all__ = [
     "vectorization_config_from_dict",
     "vectorize_parquet_files",
 ]
-

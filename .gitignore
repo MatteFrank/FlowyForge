@@ -2,6 +2,7 @@ data/
 outputs/
 *.npy
 *.parquet
+*.csv
 *.pt
 *.pth
 *.ckpt

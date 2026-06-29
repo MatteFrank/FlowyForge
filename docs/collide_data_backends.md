@@ -41,7 +41,7 @@ This backend is the default smoke-test route on a laptop.
 
 ## Hugging Face Backend
 
-`configs/paths/hf_collide1m.yaml` targets `fastmachinelearning/collide-1m`. It is safe by default: the helper uses Hugging Face streaming and materializes only a capped local subset controlled by `data.max_rows` and `data.max_files`.
+`configs/paths/hf_collide1m.yaml` targets `fastmachinelearning/collide-1m`. It is safe by default: the helper uses Hugging Face streaming, selects one process folder with `paths.hf_data_dir`, materializes only `data.max_rows` rows, and writes a flat summary parquet sample instead of full raw variable-length event rows.
 
 ```bash
 pip install datasets huggingface_hub
@@ -50,6 +50,8 @@ python scripts/inspect_dataset.py --config configs/paths/hf_collide1m.yaml
 ```
 
 The HF backend must not download the full dataset unless a future explicit config and workflow are added for that purpose.
+
+See [hf_smoke_pipeline.md](hf_smoke_pipeline.md) for the safe summary materialization mode and why raw mode is dangerous on a laptop.
 
 ## Manifests
 

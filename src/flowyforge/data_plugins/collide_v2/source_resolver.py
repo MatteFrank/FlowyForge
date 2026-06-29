@@ -23,6 +23,8 @@ class ResolvedDatasetSource:
     process_folders: list[Path]
     hf_dataset_name: str | None = None
     hf_split: str | None = None
+    hf_data_dir: str | None = None
+    hf_data_files: str | list[str] | None = None
     local_cache_dir: Path | None = None
 
 
@@ -50,6 +52,8 @@ def resolve_dataset_source(
 
     hf_dataset_name = paths_cfg.get("hf_dataset_name")
     hf_split = paths_cfg.get("hf_split")
+    hf_data_dir = paths_cfg.get("hf_data_dir")
+    hf_data_files = paths_cfg.get("hf_data_files")
     local_cache_dir = _optional_path(paths_cfg.get("local_cache_dir"))
 
     if backend in {"eos", "local"} and not allow_missing and not dataset_dir.exists():
@@ -75,6 +79,8 @@ def resolve_dataset_source(
         process_folders=process_folders,
         hf_dataset_name=str(hf_dataset_name) if hf_dataset_name else None,
         hf_split=str(hf_split) if hf_split else None,
+        hf_data_dir=str(hf_data_dir) if hf_data_dir else None,
+        hf_data_files=hf_data_files,
         local_cache_dir=local_cache_dir,
     )
 
@@ -123,4 +129,3 @@ def _list_process_folders(dataset_dir: Path, parquet_files: list[Path]) -> list[
 
 
 __all__ = ["ResolvedDatasetSource", "resolve_dataset_source"]
-

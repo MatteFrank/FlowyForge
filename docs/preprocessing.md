@@ -1,18 +1,42 @@
 # COLLIDE Preprocessing
 
-B1.8 implements minimal pploner-style preprocessing after vectorization.
+Preprocessing is the next step after vectorization.
 
-The preserved fast-track pipeline is:
+For the broader pipeline, see [pipeline_explained.md](pipeline_explained.md). For the previous stage, see [vectorization.md](vectorization.md).
+
+## Role In The Pipeline
 
 ```text
 Parquet -> vectorized .npy -> preprocessing -> training
 ```
 
-This step reads `processed_data_dir/vectorized/X.npy`, computes per-feature standardization statistics, and writes a preprocessed array for the next phase: minimal classification training.
+B1.8 implements minimal standardization for local and Hugging Face materialized tiny samples.
 
-## Current Method
+Input:
 
-The only supported method is:
+```text
+processed_data_dir/vectorized/X.npy
+```
+
+Output:
+
+```text
+processed_data_dir/preprocessed/
+```
+
+## Command
+
+```bash
+python scripts/preprocess_collide.py --config configs/paths/local.yaml
+```
+
+For HF materialized samples:
+
+```bash
+python scripts/preprocess_collide.py --config configs/paths/hf_collide1m.yaml
+```
+
+## Configuration
 
 ```yaml
 preprocessing:
@@ -23,51 +47,55 @@ preprocessing:
   copy_labels: true
 ```
 
-For each feature, preprocessing computes:
+Only `standardize` is currently implemented.
+
+## Standardization
+
+The current transformation is:
+
+```text
+X_preprocessed = (X - mean) / safe_std
+```
+
+Statistics are computed per feature:
 
 - `mean`
 - `std`
 - `safe_std`
 
-If a feature has `std < eps`, `safe_std` is set to `1.0`, which prevents NaN or infinity values for constant columns.
+For nearly constant features:
+
+```text
+safe_std = 1.0 when std < eps
+```
+
+This avoids division by zero and prevents NaN or infinity values.
 
 ## Outputs
 
-The vectorized directory remains unchanged:
-
-```text
-processed_data_dir/vectorized/
-  X.npy
-  y.npy optional
-  feature_map.json
-  label_map.json optional
-  vectorization_manifest.json
-```
-
 The preprocessed directory contains:
 
-```text
-processed_data_dir/preprocessed/
-  X_preprocessed.npy
-  y.npy optional copied from vectorized/
-  preprocessing_stats.json
-  preprocessing_manifest.json
-  feature_map.json copied from vectorized/
-  label_map.json optional copied from vectorized/
-```
+- `X_preprocessed.npy`
+- optional copied `y.npy`
+- `preprocessing_stats.json`
+- `preprocessing_manifest.json`
+- copied `feature_map.json`
+- optional copied `label_map.json`
 
-## Important Limitation
+`preprocessing_stats.json` stores the means, standard deviations, safe standard deviations, `eps`, number of rows, and number of features.
 
-The current scaler uses all available vectorized rows. That is acceptable for local/HF tiny-sample smoke work, but the production path should fit preprocessing statistics only on the train split.
+`preprocessing_manifest.json` records input and output paths, whether labels are available, the method, row count, feature count, and the current tiny-sample warning.
 
-EOS-scale preprocessing is also deferred. Full CERN-scale processing will likely require chunked arrays and batch orchestration.
+## Why Standardization?
 
-## Commands
+HEP features often live on different numerical scales. Early MLP or transformer baselines tend to train more stably when input features have comparable scale. Standardization is the simplest reasonable baseline before adding more domain-specific transforms.
 
-```bash
-python scripts/vectorize_collide.py --config configs/paths/local.yaml
-python scripts/preprocess_collide.py --config configs/paths/local.yaml
-```
+## Current Limitations
 
-The preprocessed output prepares the dataset for the next step: minimal classification training.
+- The scaler currently uses all available vectorized rows.
+- Future training should fit preprocessing statistics only on the train split.
+- EOS-scale preprocessing is not implemented yet.
+- Future methods may include log transforms, robust scaling, clipping, and feature-specific transforms.
+
+This prepares the dataset for the next step: minimal classification training.
 

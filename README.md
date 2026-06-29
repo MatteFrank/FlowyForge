@@ -16,6 +16,26 @@ pip install -e .
 pytest tests/
 ```
 
+## Data Pipeline Status
+
+Current fast-track pipeline:
+
+```text
+Parquet -> inspect/manifest -> vectorize -> preprocess -> training later
+```
+
+Current supported backends:
+
+- local tiny Parquet sample
+- Hugging Face materialized subset
+- EOS path on LXPLUS, not yet full-scale vectorization
+
+Docs:
+
+- [Pipeline explained](docs/pipeline_explained.md)
+- [Vectorization](docs/vectorization.md)
+- [Preprocessing](docs/preprocessing.md)
+
 ## Smoke Commands
 
 ```bash

@@ -2,7 +2,7 @@
 
 FlowyForge is a modular foundation platform for complex scientific data. The first fast-track path targets COLLIDE-2V / HEP workflows while keeping the package extensible to future datasets, task plugins, model plugins, and analysis tools.
 
-Current status: early skeleton plus COLLIDE parquet-source inspection, manifest preparation, minimal tiny-sample vectorization, and minimal preprocessing. It does not access EOS, download full datasets, or implement production ML training yet.
+Current status: early skeleton plus COLLIDE parquet-source inspection, manifest preparation, minimal tiny-sample vectorization, preprocessing, and a tiny MLP classification sanity check. It does not access EOS, download full datasets, or implement production ML training yet.
 
 ## Install
 
@@ -21,7 +21,7 @@ pytest tests/
 Current fast-track pipeline:
 
 ```text
-Parquet -> inspect/manifest -> vectorize -> preprocess -> training later
+Parquet -> inspect/manifest -> vectorize -> preprocess -> tiny training baseline
 ```
 
 Current supported backends:
@@ -35,6 +35,7 @@ Docs:
 - [Pipeline explained](docs/pipeline_explained.md)
 - [Vectorization](docs/vectorization.md)
 - [Preprocessing](docs/preprocessing.md)
+- [Training](docs/training.md)
 
 ## Smoke Commands
 
@@ -44,6 +45,7 @@ python scripts/prepare_collide_source.py --config configs/paths/local.yaml
 python scripts/inspect_dataset.py --config configs/paths/local.yaml
 python scripts/vectorize_collide.py --config configs/paths/local.yaml
 python scripts/preprocess_collide.py --config configs/paths/local.yaml
+python scripts/train_task.py --config configs/paths/local.yaml --task classification --model mlp
 ```
 
 ## HF Small Sample

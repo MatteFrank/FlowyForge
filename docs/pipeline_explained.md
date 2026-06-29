@@ -151,16 +151,26 @@ Current limitations:
 - real training should fit the scaler only on the train split
 - future methods may include log transforms, robust scaling, and feature-specific physics transforms
 
-## Step 5: Training, Future
+## Step 5: Training
 
-The next step will consume:
+B1.9 adds a minimal supervised classification baseline.
+
+Command:
+
+```bash
+python scripts/train_task.py --config configs/paths/local.yaml --task classification --model mlp
+```
+
+Training consumes:
 
 - `X_preprocessed.npy`
-- optional `y.npy`
+- `y.npy`
 - feature and label maps
 - preprocessing metadata
 
-The first baseline should be simple: either `LogisticRegression` or a tiny MLP. Later, training should move through FlowyForge task and model plugins so classification, trigger, masked modeling, calorimeter generation, and foundation-style encoders share a consistent interface.
+The current model is a tiny PyTorch MLP trained with cross-entropy loss. It writes `checkpoint.pt`, `metrics.json`, and `training_manifest.json` under `processed_data_dir/training/classification_mlp/`.
+
+This is a pipeline sanity check, not a physics-validated model. Later, training should move more fully through FlowyForge task and model plugins so classification, trigger, masked modeling, calorimeter generation, and foundation-style encoders share a consistent interface.
 
 ## Current Limitations
 
@@ -169,5 +179,4 @@ The first baseline should be simple: either `LogisticRegression` or a tiny MLP. 
 - No nested object tokenization yet.
 - No graph builder yet.
 - No clean train/val/test split for preprocessing statistics yet.
-- No training loop or PyTorch Dataset yet.
-
+- Training is only a tiny MLP classification sanity check.

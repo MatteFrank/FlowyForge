@@ -1,4 +1,4 @@
-"""Tiny MLP placeholder model."""
+"""Tiny MLP model plugin."""
 
 from __future__ import annotations
 
@@ -10,12 +10,23 @@ from flowyforge.model_plugins.base import ModelPlugin
 
 
 class MLPModel(ModelPlugin):
-    def __init__(self, input_dim: int = 1, hidden_dim: int = 8, output_dim: int = 1) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 32,
+        output_dim: int = 2,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         self.input_dim = input_dim
-        self.encoder = torch.nn.Sequential(
+        layers: list[torch.nn.Module] = [
             torch.nn.Linear(input_dim, hidden_dim),
             torch.nn.ReLU(),
+        ]
+        if dropout > 0:
+            layers.append(torch.nn.Dropout(dropout))
+        self.encoder = torch.nn.Sequential(
+            *layers,
         )
         self.head = torch.nn.Linear(hidden_dim, output_dim)
 
@@ -38,4 +49,3 @@ class MLPModel(ModelPlugin):
 
 
 __all__ = ["MLPModel"]
-

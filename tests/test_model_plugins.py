@@ -10,7 +10,7 @@ from flowyforge.model_plugins import (
 
 def test_model_plugins_instantiate_and_forward() -> None:
     models = [
-        MLPModel(),
+        MLPModel(input_dim=1),
         TinyTransformerModel(),
         GraphTransformerModel(),
         FoundationEncoder(),
@@ -24,4 +24,3 @@ def test_model_plugins_instantiate_and_forward() -> None:
     ]
     assert isinstance(models[0](torch.zeros(1, 1)), torch.Tensor)
     assert all(isinstance(model.get_embeddings({}), torch.Tensor) for model in models)
-

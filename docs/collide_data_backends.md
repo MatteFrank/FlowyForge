@@ -63,3 +63,7 @@ Row counts are read from parquet metadata where possible, so manifest generation
 ## Vectorization Status
 
 B1.7 provides minimal pandas-based vectorization for local and HF materialized tiny samples. It writes `X.npy`, optional `y.npy`, feature/label maps, and `vectorization_manifest.json` under `paths.processed_data_dir / data.output_subdir`. Full EOS-scale vectorization is intentionally deferred and guarded by a small `max_files` safety check.
+
+## Preprocessing Status
+
+B1.8 provides minimal standardization for vectorized local/HF tiny samples. It reads `processed_data_dir/vectorized/X.npy`, writes `processed_data_dir/preprocessed/X_preprocessed.npy`, copies optional labels and maps, and records `preprocessing_stats.json` plus `preprocessing_manifest.json`. Train-only statistics and EOS-scale preprocessing come later.

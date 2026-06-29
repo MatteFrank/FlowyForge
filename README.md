@@ -2,7 +2,7 @@
 
 FlowyForge is a modular foundation platform for complex scientific data. The first fast-track path targets COLLIDE-2V / HEP workflows while keeping the package extensible to future datasets, task plugins, model plugins, and analysis tools.
 
-Current status: early skeleton plus COLLIDE parquet-source inspection, manifest preparation, and minimal tiny-sample vectorization. It does not access EOS, download full datasets, or implement production ML training yet.
+Current status: early skeleton plus COLLIDE parquet-source inspection, manifest preparation, minimal tiny-sample vectorization, and minimal preprocessing. It does not access EOS, download full datasets, or implement production ML training yet.
 
 ## Install
 
@@ -23,6 +23,7 @@ python scripts/make_tiny_parquet_sample.py --config configs/paths/local.yaml
 python scripts/prepare_collide_source.py --config configs/paths/local.yaml
 python scripts/inspect_dataset.py --config configs/paths/local.yaml
 python scripts/vectorize_collide.py --config configs/paths/local.yaml
+python scripts/preprocess_collide.py --config configs/paths/local.yaml
 ```
 
 ## HF Small Sample
@@ -33,6 +34,7 @@ jupyter notebook notebooks/00_hf_collide1m_quickstart.ipynb
 python scripts/prepare_collide_source.py --config configs/paths/hf_collide1m.yaml
 python scripts/inspect_dataset.py --config configs/paths/hf_collide1m.yaml
 python scripts/vectorize_collide.py --config configs/paths/hf_collide1m.yaml
+python scripts/preprocess_collide.py --config configs/paths/hf_collide1m.yaml
 ```
 
 ## EOS Later On LXPLUS

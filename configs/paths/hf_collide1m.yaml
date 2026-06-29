@@ -19,3 +19,10 @@ data:
   output_subdir: vectorized
   processes: null
   materialize_local_parquet: true
+
+preprocessing:
+  method: standardize
+  eps: 1.0e-6
+  input_subdir: vectorized
+  output_subdir: preprocessed
+  copy_labels: true

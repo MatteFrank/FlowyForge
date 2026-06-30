@@ -38,6 +38,7 @@ Docs:
 - [Training](docs/training.md)
 - [Evaluation](docs/evaluation.md)
 - [HF smoke pipeline](docs/hf_smoke_pipeline.md)
+- [HF multi-process classification](docs/hf_multi_process_classification.md)
 
 ## Smoke Commands
 
@@ -64,8 +65,16 @@ python scripts/preprocess_collide.py --config configs/paths/hf_collide1m.yaml
 
 ## HF Smoke Pipeline
 
+The default HF config materializes two tiny process folders, enough to exercise the classification path. Use the listing helper if you want to replace or extend `paths.hf_data_dirs`.
+
 ```bash
 pip install datasets huggingface_hub
+python scripts/list_hf_collide_dirs.py --max-dirs 30
+```
+
+Keep at least two entries under `paths.hf_data_dirs` for a tiny classification smoke sample.
+
+```bash
 python scripts/prepare_collide_source.py --config configs/paths/hf_collide1m.yaml
 python scripts/inspect_dataset.py --config configs/paths/hf_collide1m.yaml
 python scripts/vectorize_collide.py --config configs/paths/hf_collide1m.yaml
@@ -73,7 +82,7 @@ python scripts/preprocess_collide.py --config configs/paths/hf_collide1m.yaml
 python scripts/run_hf_smoke_pipeline.py --config configs/paths/hf_collide1m.yaml
 ```
 
-If `y.npy` exists, training and evaluation can run. If `y.npy` is absent, the HF smoke pipeline still succeeds as X-only validation.
+If `y.npy` exists with at least two classes, training and evaluation can run. If `y.npy` is absent or contains only one class, the HF smoke pipeline still succeeds as X-only or single-class validation.
 
 ## EOS Later On LXPLUS
 

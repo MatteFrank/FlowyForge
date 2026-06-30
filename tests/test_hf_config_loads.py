@@ -24,8 +24,13 @@ def test_hf_path_config_loads_without_downloading() -> None:
     assert source.hf_dataset_name == "fastmachinelearning/collide-1m"
     assert source.hf_split == "train"
     assert source.hf_data_dir == "WJetsToLNu_13TeV-madgraphMLM-pythia8"
+    assert source.hf_data_dirs == [
+        "WJetsToLNu_13TeV-madgraphMLM-pythia8",
+        "DYJetsToLL_13TeV-madgraphMLM-pythia8",
+    ]
     assert isinstance(source.parquet_files, list)
     assert config["data"]["materialize_local_parquet"] is True
-    assert config["data"]["max_rows"] == 20
+    assert config["data"]["max_rows"] is None
+    assert config["data"]["max_rows_per_process"] == 20
     assert config["data"]["max_files"] == 1
     assert config["data"]["hf_materialization_mode"] == "summary"

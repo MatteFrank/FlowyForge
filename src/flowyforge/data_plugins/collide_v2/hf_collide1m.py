@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,7 @@ def materialize_hf_collide1m_subset(
     data_files: str | list[str] | None = None,
     columns: list[str] | None = None,
     materialization_mode: str = "summary",
+    process_id: int | None = None,
 ) -> dict[str, Any]:
     """Materialize a small streaming HF subset as local parquet.
 
@@ -108,7 +110,7 @@ def materialize_hf_collide1m_subset(
                         row,
                         columns=summary_columns,
                         process_name=data_dir,
-                        process_id=_stable_process_id(data_dir),
+                        process_id=process_id if process_id is not None else _stable_process_id(data_dir),
                         event_id=rows_written + offset,
                     )
                     for offset, row in enumerate(raw_rows)
@@ -148,6 +150,96 @@ def materialize_hf_collide1m_subset(
     manifest_path = output_path / "hf_subset_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     manifest["manifest_path"] = str(manifest_path)
+    return manifest
+
+
+def materialize_hf_collide1m_multi_process_subset(
+    dataset_name: str,
+    split: str,
+    output_dir: str | Path,
+    data_dirs: list[str],
+    max_rows_per_process: int = 20,
+    max_files_per_process: int = 1,
+    columns: list[str] | None = None,
+    materialization_mode: str = "summary",
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Materialize tiny summary parquet files for several HF process folders."""
+
+    if not data_dirs:
+        raise ValueError("data_dirs must contain at least one HF process folder.")
+    if max_rows_per_process < 0:
+        raise ValueError("max_rows_per_process must be non-negative.")
+    if max_files_per_process <= 0:
+        raise ValueError("max_files_per_process must be positive.")
+
+    output_path = Path(output_dir).expanduser()
+    output_path.mkdir(parents=True, exist_ok=True)
+    _clear_previous_materialization(output_path)
+
+    process_to_id = {data_dir: index for index, data_dir in enumerate(data_dirs)}
+    rows_written_per_process: dict[str, int] = {}
+    parquet_files: list[str] = []
+    errors: dict[str, str] = {}
+
+    for data_dir, process_index in process_to_id.items():
+        process_folder = _safe_process_name(data_dir)
+        process_output_dir = output_path / process_folder
+        try:
+            process_manifest = materialize_hf_collide1m_subset(
+                dataset_name=dataset_name,
+                split=split,
+                output_dir=process_output_dir,
+                max_rows=max_rows_per_process,
+                max_files=max_files_per_process,
+                seed=seed,
+                data_dir=data_dir,
+                columns=columns,
+                materialization_mode=materialization_mode,
+                process_id=process_index,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep other processes materializing.
+            rows_written_per_process[data_dir] = 0
+            errors[data_dir] = f"{exc.__class__.__name__}: {exc}"
+            continue
+
+        rows_written = int(process_manifest.get("rows_written", 0))
+        rows_written_per_process[data_dir] = rows_written
+        if rows_written <= 0:
+            errors[data_dir] = "No rows materialized."
+            continue
+        parquet_files.extend(
+            f"{process_folder}/{parquet_name}"
+            for parquet_name in process_manifest.get("parquet_files", [])
+        )
+
+    processes_materialized = sum(1 for rows in rows_written_per_process.values() if rows > 0)
+    warning = "Streaming tiny subset only; never use this helper to download the full COLLIDE-1M dataset."
+    if processes_materialized < 2:
+        warning += " Only one class materialized; classification training will be skipped or fail gracefully."
+
+    manifest = {
+        "dataset_name": dataset_name,
+        "split": split,
+        "seed": seed,
+        "data_dirs": data_dirs,
+        "process_to_id": process_to_id,
+        "rows_written_per_process": rows_written_per_process,
+        "parquet_files": parquet_files,
+        "materialization_mode": materialization_mode,
+        "summary_columns": columns or DEFAULT_SUMMARY_COLUMNS,
+        "processes_requested": len(data_dirs),
+        "processes_materialized": processes_materialized,
+        "classification_possible": processes_materialized >= 2,
+        "errors": errors,
+        "warning": warning,
+    }
+    manifest_path = output_path / "hf_multi_subset_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest["manifest_path"] = str(manifest_path)
+
+    if processes_materialized == 0:
+        raise RuntimeError(f"No HF processes were materialized successfully. Errors: {errors}")
     return manifest
 
 
@@ -207,11 +299,18 @@ def _load_streaming_dataset(
 
 
 def _clear_previous_materialization(output_path: Path) -> None:
-    for parquet_path in output_path.glob("part-*.parquet"):
+    for parquet_path in output_path.rglob("part-*.parquet"):
         parquet_path.unlink()
-    manifest_path = output_path / "hf_subset_manifest.json"
-    if manifest_path.exists():
+    for manifest_path in output_path.rglob("hf_subset_manifest.json"):
         manifest_path.unlink()
+    multi_manifest_path = output_path / "hf_multi_subset_manifest.json"
+    if multi_manifest_path.exists():
+        multi_manifest_path.unlink()
+
+
+def _safe_process_name(process_name: str) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", process_name).strip("._-")
+    return safe_name or "process"
 
 
 def _to_numeric_array(value: Any) -> np.ndarray:
@@ -255,4 +354,8 @@ def _stable_process_id(process_name: str | None) -> int | None:
     return sum(ord(char) for char in process_name) % 1_000_000
 
 
-__all__ = ["materialize_hf_collide1m_subset", "summarize_hf_event_row"]
+__all__ = [
+    "materialize_hf_collide1m_multi_process_subset",
+    "materialize_hf_collide1m_subset",
+    "summarize_hf_event_row",
+]

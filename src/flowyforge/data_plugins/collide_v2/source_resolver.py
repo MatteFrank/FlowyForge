@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,7 @@ class ResolvedDatasetSource:
     hf_dataset_name: str | None = None
     hf_split: str | None = None
     hf_data_dir: str | None = None
+    hf_data_dirs: list[str] = field(default_factory=list)
     hf_data_files: str | list[str] | None = None
     local_cache_dir: Path | None = None
 
@@ -52,7 +53,8 @@ def resolve_dataset_source(
 
     hf_dataset_name = paths_cfg.get("hf_dataset_name")
     hf_split = paths_cfg.get("hf_split")
-    hf_data_dir = paths_cfg.get("hf_data_dir")
+    hf_data_dirs = _normalize_hf_data_dirs(paths_cfg)
+    hf_data_dir = hf_data_dirs[0] if hf_data_dirs else None
     hf_data_files = paths_cfg.get("hf_data_files")
     local_cache_dir = _optional_path(paths_cfg.get("local_cache_dir"))
 
@@ -79,7 +81,8 @@ def resolve_dataset_source(
         process_folders=process_folders,
         hf_dataset_name=str(hf_dataset_name) if hf_dataset_name else None,
         hf_split=str(hf_split) if hf_split else None,
-        hf_data_dir=str(hf_data_dir) if hf_data_dir else None,
+        hf_data_dir=hf_data_dir,
+        hf_data_dirs=hf_data_dirs,
         hf_data_files=hf_data_files,
         local_cache_dir=local_cache_dir,
     )
@@ -112,6 +115,18 @@ def _optional_path(value: str | os.PathLike[str] | None) -> Path | None:
     if value is None:
         return None
     return _expand_path(value)
+
+
+def _normalize_hf_data_dirs(paths_cfg: dict[str, Any]) -> list[str]:
+    plural = paths_cfg.get("hf_data_dirs")
+    if plural is None:
+        single = paths_cfg.get("hf_data_dir")
+        return [str(single)] if single else []
+    if isinstance(plural, (str, os.PathLike)):
+        return [os.fspath(plural)]
+    if not isinstance(plural, list):
+        raise ValueError("Config key 'paths.hf_data_dirs' must be a list of strings when present.")
+    return [str(item) for item in plural if item]
 
 
 def _list_process_folders(dataset_dir: Path, parquet_files: list[Path]) -> list[Path]:

@@ -60,5 +60,26 @@ def test_source_resolver_hf_allows_missing_materialized_dir(tmp_path: Path) -> N
     assert source.hf_dataset_name == "fastmachinelearning/collide-1m"
     assert source.hf_split == "train"
     assert source.hf_data_dir == "WJetsToLNu_13TeV-madgraphMLM-pythia8"
+    assert source.hf_data_dirs == ["WJetsToLNu_13TeV-madgraphMLM-pythia8"]
     assert source.hf_data_files == "sample.parquet"
     assert source.local_cache_dir == tmp_path / "cache"
+
+
+def test_source_resolver_hf_plural_data_dirs_take_precedence(tmp_path: Path) -> None:
+    source = resolve_dataset_source(
+        {
+            "paths": {
+                "dataset_backend": "hf",
+                "hf_dataset_name": "fastmachinelearning/collide-1m",
+                "hf_split": "train",
+                "hf_data_dir": "legacy",
+                "hf_data_dirs": ["proc_a", "proc_b"],
+                "dataset_dir": str(tmp_path / "cache" / "parquet_export"),
+                "processed_data_dir": str(tmp_path / "processed"),
+                "tmp_data_dir": str(tmp_path / "tmp"),
+            }
+        }
+    )
+
+    assert source.hf_data_dir == "proc_a"
+    assert source.hf_data_dirs == ["proc_a", "proc_b"]

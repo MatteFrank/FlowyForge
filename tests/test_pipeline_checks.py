@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from flowyforge.data_plugins.collide_v2.pipeline_checks import collect_pipeline_artifacts, file_exists
+import numpy as np
+
+from flowyforge.data_plugins.collide_v2.pipeline_checks import (
+    classification_ready,
+    collect_pipeline_artifacts,
+    count_classes_from_y,
+    file_exists,
+)
 
 
 def test_file_exists(tmp_path: Path) -> None:
@@ -36,3 +43,18 @@ def test_collect_pipeline_artifacts(tmp_path: Path) -> None:
     assert artifacts["training_metrics"] is True
     assert artifacts["evaluation_metrics"] is False
 
+
+def test_classification_ready_requires_two_classes(tmp_path: Path) -> None:
+    processed_dir = tmp_path / "processed"
+    y_path = processed_dir / "preprocessed" / "y.npy"
+    y_path.parent.mkdir(parents=True)
+
+    assert classification_ready(processed_dir) is False
+
+    np.save(y_path, np.asarray([0, 0, 0], dtype=np.int64))
+    assert count_classes_from_y(y_path) == 1
+    assert classification_ready(processed_dir) is False
+
+    np.save(y_path, np.asarray([0, 1, 1], dtype=np.int64))
+    assert count_classes_from_y(y_path) == 2
+    assert classification_ready(processed_dir) is True

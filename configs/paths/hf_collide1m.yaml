@@ -2,15 +2,18 @@ paths:
   dataset_backend: hf
   hf_dataset_name: fastmachinelearning/collide-1m
   hf_split: train
-  hf_data_dir: WJetsToLNu_13TeV-madgraphMLM-pythia8
+  hf_data_dirs:
+    - WJetsToLNu_13TeV-madgraphMLM-pythia8
+    - DYJetsToLL_13TeV-madgraphMLM-pythia8
   local_cache_dir: data/hf_cache/collide-1m
   dataset_dir: data/hf_cache/collide-1m/parquet_export
   tmp_data_dir: data/tmp
   processed_data_dir: data/processed/collide1m
 
 data:
-  max_files: 2
-  max_rows: 500
+  max_files: 1
+  max_rows_per_process: 20
+  max_rows: null
   hf_materialization_mode: summary
   hf_summary_columns:
     - FullReco_MET_MET

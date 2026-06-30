@@ -1,12 +1,13 @@
 # Hugging Face Smoke Pipeline
 
-B1.11 validates the Hugging Face backend with a very small materialized sample from `fastmachinelearning/collide-1m`.
+B1.11 validates the Hugging Face backend with a very small materialized sample from `fastmachinelearning/collide-1m`. B1.12 extends that path to support multiple configured HF process folders for a tiny classification smoke test.
 
 The HF backend is for smoke validation, not full dataset download. `configs/paths/hf_collide1m.yaml` is intentionally conservative:
 
-- `paths.hf_data_dir` selects one process folder instead of resolving every shard in the dataset.
-- `data.max_rows` defaults to `20`, enough to validate the code path without keeping large event objects in memory.
-- `data.max_files` defaults to `1`.
+- `paths.hf_data_dirs` selects one or more process folders instead of resolving every shard in the dataset.
+- `data.max_rows_per_process` defaults to `20`, enough to validate the code path without keeping large event objects in memory.
+- `data.max_files` defaults to `1` file per process.
+- `data.max_rows` defaults to `null` so vectorization reads all tiny materialized process files.
 - `data.hf_materialization_mode` defaults to `summary`.
 
 The helper always uses `streaming=True`.
@@ -24,6 +25,8 @@ HF streaming subset -> local parquet -> inspect/manifest -> vectorize -> preproc
 ```
 
 If labels exist, it also runs tiny MLP training and evaluation.
+
+For supervised classification, configure at least two `paths.hf_data_dirs`. A single process creates a valid backend smoke sample but only one `process_id` class.
 
 ## Safe Materialization
 
@@ -46,12 +49,13 @@ Unauthenticated Hugging Face requests may show warnings or rate-limit messages. 
 
 ## Outcomes
 
-There are two successful outcomes:
+There are three successful outcomes:
 
 - `supervised_complete`: `y.npy` exists, so training and evaluation ran.
+- `single_class_complete`: `y.npy` exists, but it contains only one class, so training was skipped.
 - `x_only_complete`: no configured label column was found, so the pipeline stopped after preprocessing.
 
-X-only mode is not a failure. It still validates:
+X-only and single-class modes are not failures. They still validate:
 
 - schema handling
 - parquet materialization
@@ -60,6 +64,7 @@ X-only mode is not a failure. It still validates:
 - future self-supervised or unlabeled workflows
 
 If supervised training is desired, set `data.label_column` to a column that exists in the materialized HF sample.
+For process classification, keep `data.label_column: process_id` and add at least two `paths.hf_data_dirs`.
 
 ## Reports
 
@@ -74,4 +79,6 @@ The report records backend metadata, dataset paths, parquet count, key artifact 
 
 ## Safety
 
-The full HF dataset must not be downloaded by default. Keep `hf_data_dir`, `max_rows`, and `max_files` small for this smoke path.
+The full HF dataset must not be downloaded by default. Keep `hf_data_dirs`, `max_rows_per_process`, and `max_files` small for this smoke path.
+
+See [hf_multi_process_classification.md](hf_multi_process_classification.md) for the multi-process classification workflow.

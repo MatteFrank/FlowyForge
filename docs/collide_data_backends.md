@@ -41,7 +41,7 @@ This backend is the default smoke-test route on a laptop.
 
 ## Hugging Face Backend
 
-`configs/paths/hf_collide1m.yaml` targets `fastmachinelearning/collide-1m`. It is safe by default: the helper uses Hugging Face streaming, selects one process folder with `paths.hf_data_dir`, materializes only `data.max_rows` rows, and writes a flat summary parquet sample instead of full raw variable-length event rows.
+`configs/paths/hf_collide1m.yaml` targets `fastmachinelearning/collide-1m`. It is safe by default: the helper uses Hugging Face streaming, selects configured process folders with `paths.hf_data_dirs`, materializes only `data.max_rows_per_process` rows per process, and writes flat summary parquet samples instead of full raw variable-length event rows.
 
 ```bash
 pip install datasets huggingface_hub

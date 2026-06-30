@@ -10,14 +10,21 @@ from pathlib import Path
 from typing import Any
 
 from flowyforge.core.config import load_config
-from flowyforge.data_plugins.collide_v2.hf_collide1m import materialize_hf_collide1m_subset
+from flowyforge.data_plugins.collide_v2.hf_collide1m import (
+    materialize_hf_collide1m_multi_process_subset,
+    materialize_hf_collide1m_subset,
+)
 from flowyforge.data_plugins.collide_v2.manifest import (
     create_split_manifest,
     scan_parquet_event_counts,
     write_file_event_counts,
     write_split_manifest,
 )
-from flowyforge.data_plugins.collide_v2.pipeline_checks import collect_pipeline_artifacts
+from flowyforge.data_plugins.collide_v2.pipeline_checks import (
+    classification_ready,
+    collect_pipeline_artifacts,
+    count_classes_from_y,
+)
 from flowyforge.data_plugins.collide_v2.pploner_adapter import prepare_pploner_paths
 from flowyforge.data_plugins.collide_v2.preprocessing import (
     preprocess_vectorized_dataset,
@@ -75,21 +82,28 @@ def run_hf_smoke_pipeline(config: dict[str, Any]) -> dict[str, Any]:
         "set data.label_column to an available supervised target column if training is desired."
     )
     if artifacts["preprocessed_y"]:
-        training_result = train_tiny_mlp_classifier(
-            processed_data_dir=pipeline_paths.processed_data_dir,
-            config=training_config_from_dict(config),
-        )
-        artifacts = collect_pipeline_artifacts(pipeline_paths.processed_data_dir)
-        try:
-            evaluate_trained_classifier(
+        if classification_ready(pipeline_paths.processed_data_dir):
+            training_result = train_tiny_mlp_classifier(
                 processed_data_dir=pipeline_paths.processed_data_dir,
-                config=evaluation_config_from_dict(config),
+                config=training_config_from_dict(config),
             )
             artifacts = collect_pipeline_artifacts(pipeline_paths.processed_data_dir)
-        except FileNotFoundError:
-            pass
-        status = "supervised_complete"
-        next_action = f"Inspect metrics and checkpoint under {training_result.output_dir}."
+            try:
+                evaluate_trained_classifier(
+                    processed_data_dir=pipeline_paths.processed_data_dir,
+                    config=evaluation_config_from_dict(config),
+                )
+                artifacts = collect_pipeline_artifacts(pipeline_paths.processed_data_dir)
+            except FileNotFoundError:
+                pass
+            status = "supervised_complete"
+            next_action = f"Inspect metrics and checkpoint under {training_result.output_dir}."
+        else:
+            status = "single_class_complete"
+            next_action = (
+                "HF materialization succeeded, but classification requires at least two "
+                "hf_data_dirs."
+            )
 
     report = _build_report(
         source=source,
@@ -129,17 +143,34 @@ def _materialize_if_needed(config: dict[str, Any], source: ResolvedDatasetSource
         return source
     if source.hf_dataset_name is None or source.hf_split is None:
         raise ValueError("HF backend requires paths.hf_dataset_name and paths.hf_split.")
-    materialize_hf_collide1m_subset(
-        dataset_name=source.hf_dataset_name,
-        split=source.hf_split,
-        output_dir=source.dataset_dir,
-        max_rows=int(data.get("max_rows") or 20),
-        max_files=int(data.get("max_files") or 1),
-        data_dir=source.hf_data_dir,
-        data_files=source.hf_data_files,
-        columns=data.get("hf_summary_columns"),
-        materialization_mode=str(data.get("hf_materialization_mode", "summary")),
-    )
+    if not source.hf_data_dirs and source.hf_data_files is None:
+        raise ValueError("HF materialization requires paths.hf_data_dirs or paths.hf_data_files.")
+    max_rows_per_process = _max_rows_per_process(data)
+    max_files_per_process = _int_config(data, "max_files", 1)
+    if len(source.hf_data_dirs) > 1:
+        materialize_hf_collide1m_multi_process_subset(
+            dataset_name=source.hf_dataset_name,
+            split=source.hf_split,
+            output_dir=source.dataset_dir,
+            data_dirs=source.hf_data_dirs,
+            max_rows_per_process=max_rows_per_process,
+            max_files_per_process=max_files_per_process,
+            columns=data.get("hf_summary_columns"),
+            materialization_mode=str(data.get("hf_materialization_mode", "summary")),
+        )
+    else:
+        materialize_hf_collide1m_subset(
+            dataset_name=source.hf_dataset_name,
+            split=source.hf_split,
+            output_dir=source.dataset_dir,
+            max_rows=max_rows_per_process,
+            max_files=max_files_per_process,
+            data_dir=source.hf_data_dir,
+            data_files=source.hf_data_files,
+            columns=data.get("hf_summary_columns"),
+            materialization_mode=str(data.get("hf_materialization_mode", "summary")),
+            process_id=0 if source.hf_data_dir else None,
+        )
     return resolve_dataset_source(config)
 
 
@@ -170,6 +201,7 @@ def _build_report(
         "hf_dataset_name": source.hf_dataset_name,
         "hf_split": source.hf_split,
         "hf_data_dir": source.hf_data_dir,
+        "hf_data_dirs": source.hf_data_dirs,
         "dataset_dir": str(source.dataset_dir),
         "processed_data_dir": str(processed_data_dir),
         "number_of_parquet_files": parquet_count,
@@ -180,6 +212,7 @@ def _build_report(
         "status": status,
         "next_recommended_action": next_action,
         "available_columns": schema_columns,
+        "n_classes": _count_preprocessed_classes(processed_data_dir),
     }
 
 
@@ -200,8 +233,9 @@ def _format_markdown_report(report: dict[str, Any]) -> str:
         f"- Backend: {report['backend']}",
         f"- Dataset: {report.get('hf_dataset_name')}",
         f"- Split: {report.get('hf_split')}",
-        f"- HF data_dir: {report.get('hf_data_dir') or '<all>'}",
+        f"- HF data_dirs: {', '.join(report.get('hf_data_dirs') or []) or '<all>'}",
         f"- Status: {report['status']}",
+        f"- Classes: {report['n_classes']}",
         f"- Parquet files: {report['number_of_parquet_files']}",
         f"- X.npy exists: {report['x_npy_exists']}",
         f"- X_preprocessed.npy exists: {report['x_preprocessed_npy_exists']}",
@@ -215,6 +249,25 @@ def _format_markdown_report(report: dict[str, Any]) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def _int_config(config: dict[str, Any], key: str, default: int) -> int:
+    value = config.get(key)
+    return default if value is None else int(value)
+
+
+def _max_rows_per_process(config: dict[str, Any]) -> int:
+    value = config.get("max_rows_per_process")
+    if value is not None:
+        return int(value)
+    return _int_config(config, "max_rows", 20)
+
+
+def _count_preprocessed_classes(processed_data_dir: Path) -> int:
+    y_path = processed_data_dir / "preprocessed" / "y.npy"
+    if not y_path.is_file():
+        return 0
+    return count_classes_from_y(y_path)
 
 
 if __name__ == "__main__":

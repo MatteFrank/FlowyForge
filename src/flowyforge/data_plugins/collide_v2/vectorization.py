@@ -57,11 +57,19 @@ def vectorization_config_from_dict(cfg: dict[str, Any]) -> VectorizationConfig:
         feature_columns = [str(column) for column in feature_columns]
 
     exclude_columns = data_cfg.get("exclude_columns", DEFAULT_EXCLUDE_COLUMNS)
+    paths_cfg = cfg.get("paths", {})
+    max_files = data_cfg.get("max_files")
+    if (
+        isinstance(paths_cfg, dict)
+        and paths_cfg.get("dataset_backend") == "hf"
+        and "max_rows_per_process" in data_cfg
+    ):
+        max_files = data_cfg.get("vectorization_max_files")
     return VectorizationConfig(
         feature_columns=feature_columns,
         label_column=data_cfg.get("label_column", "process_id"),
         exclude_columns=[str(column) for column in exclude_columns],
-        max_files=data_cfg.get("max_files"),
+        max_files=max_files,
         max_rows=data_cfg.get("max_rows"),
         output_subdir=str(data_cfg.get("output_subdir", DEFAULT_VECTOR_OUTPUT_SUBDIR)),
     )

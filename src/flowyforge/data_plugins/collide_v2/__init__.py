@@ -5,7 +5,10 @@ from flowyforge.data_plugins.collide_v2.eos_paths import (
     list_parquet_files,
     resolve_base_path,
 )
-from flowyforge.data_plugins.collide_v2.hf_collide1m import materialize_hf_collide1m_subset
+from flowyforge.data_plugins.collide_v2.hf_collide1m import (
+    materialize_hf_collide1m_multi_process_subset,
+    materialize_hf_collide1m_subset,
+)
 from flowyforge.data_plugins.collide_v2.manifest import (
     create_split_manifest,
     scan_parquet_event_counts,
@@ -17,7 +20,9 @@ from flowyforge.data_plugins.collide_v2.pploner_adapter import (
     prepare_pploner_paths,
 )
 from flowyforge.data_plugins.collide_v2.pipeline_checks import (
+    classification_ready,
     collect_pipeline_artifacts,
+    count_classes_from_y,
     file_exists,
 )
 from flowyforge.data_plugins.collide_v2.preprocessing import (
@@ -59,8 +64,10 @@ __all__ = [
     "VectorizationResult",
     "apply_standardization",
     "build_feature_map",
+    "classification_ready",
     "collect_pipeline_artifacts",
     "compute_standardization_stats",
+    "count_classes_from_y",
     "create_split_manifest",
     "encode_labels",
     "file_exists",
@@ -69,6 +76,7 @@ __all__ = [
     "inspect_parquet_schema",
     "list_parquet_files",
     "load_feature_map",
+    "materialize_hf_collide1m_multi_process_subset",
     "materialize_hf_collide1m_subset",
     "preprocess_vectorized_dataset",
     "preprocessing_config_from_dict",

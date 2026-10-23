@@ -2,7 +2,7 @@
 
 FlowyForge is a modular foundation platform for complex scientific data. The first fast-track path targets COLLIDE-2V / HEP workflows while keeping the package extensible to future datasets, task plugins, model plugins, and analysis tools.
 
-Current status: early skeleton plus COLLIDE parquet-source inspection, manifest preparation, minimal tiny-sample vectorization, preprocessing, tiny MLP classification training, and basic evaluation/reporting. It does not access EOS, download full datasets, or implement production ML training yet.
+Current status: COLLIDE source inspection, the B1 scalar-summary/MLP baseline, and a first structured object foundation slice (ObjectTokenizer -> latent Perceiver -> event embedding -> classification). Training remains limited to feasibility smoke runs; real COLLIDE-V2 validation on LXPLUS is pending.
 
 ## Install
 
@@ -39,6 +39,31 @@ Docs:
 - [Evaluation](docs/evaluation.md)
 - [HF smoke pipeline](docs/hf_smoke_pipeline.md)
 - [HF multi-process classification](docs/hf_multi_process_classification.md)
+- [Structured foundation smoke: data contract, FullReco/L1T commands, outputs](docs/foundation_smoke.md)
+
+## Structured Foundation Smoke
+
+This path reads **original nested COLLIDE-V2 Parquet**, not the scalar-summary
+Parquet or vectorized arrays produced by B1. The existing B1 commands below
+remain unchanged. Both `--view FullReco` and `--view L1T` use the same object API;
+required column names and shapes are checked explicitly, without inferred aliases.
+
+```bash
+python scripts/train_foundation_smoke.py \
+  --process 'signal=/path/to/original/signal/*.parquet' \
+  --process 'background=/path/to/original/background/*.parquet' \
+  --view FullReco \
+  --model-config configs/models/foundation_tiny.yaml \
+  --max-events-per-class 128 --epochs 3 --batch-size 16 \
+  --learning-rate 0.001 --seed 42 \
+  --output-dir outputs/foundation_smoke/fullreco
+```
+
+Replace the process paths with original nested files. Use `--view L1T` and a
+separate output directory for the other view. The CPU smoke saves `metrics.json`
+and `checkpoint.pt`; it needs at least two classes and three events per class.
+See the [foundation smoke guide](docs/foundation_smoke.md) for the exact schema,
+collection limits, diagnostics and manual LXPLUS commands.
 
 ## Smoke Commands
 

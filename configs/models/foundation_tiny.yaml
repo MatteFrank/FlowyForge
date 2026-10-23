@@ -1,3 +1,23 @@
 model:
   name: foundation_tiny
+  embedding_dim: 64
+  num_latents: 16
+  num_heads: 4
+  num_layers: 2
+  ff_multiplier: 4
+  dropout: 0.1
+  output_dim: 64
+
+data:
+  # Exact {FullReco|L1T}_{collection}_{field} columns; never B1 summaries.
+  # Zero disables a collection. Features/dimensions derive from collection specs.
+  collection_limits:
+    PUPPIPart: 128
+    JetPuppiAK4: 16
+    Electron: 8
+    MuonTight: 8
+    PhotonTight: 8
+    PUPPIMET: 1
+  eta_clip: 5.0
+  value_clip: 1000000.0
 

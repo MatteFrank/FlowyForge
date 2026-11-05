@@ -1,0 +1,41 @@
+# One runner for original nested Parquet, both small samples and mounted EOS.
+# Paths in sources/output_dir are relative to the working directory.
+# model_config is relative to this YAML file.
+mode: small
+model_config: ../models/foundation_tiny.yaml
+output_dir: outputs/classification
+seed: 42
+
+sources:
+  small:
+    # Supply at least two NAME=PATH arguments with --process, or edit this map.
+    processes: {}
+    max_events_per_class: 128
+  eos:
+    root: /eos/project/f/foundational-model-dataset/samples/
+    process_names: null
+    max_events_per_class: null  # All events; --max-events-per-class N for a pilot.
+
+data:
+  view: FullReco
+  validation_fraction: 0.2
+  test_fraction: 0.2
+  read_batch_size: 128
+  shuffle_buffer: 512
+  audit_events_per_class: 32
+  # Explicit input units, checked against metadata when present.
+  # Missing metadata is reported as an assumption, never a verified unit.
+  units:
+    momentum: GeV
+    angle: rad
+
+training:
+  epochs: 10
+  batch_size: 32
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  gradient_clip_norm: 1.0
+  device: auto
+  num_workers: 0
+  cpu_threads: 4
+  log_every_batches: 100

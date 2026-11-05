@@ -2,7 +2,7 @@
 
 FlowyForge is a modular foundation platform for complex scientific data. The first fast-track path targets COLLIDE-2V / HEP workflows while keeping the package extensible to future datasets, task plugins, model plugins, and analysis tools.
 
-Current status: COLLIDE source inspection, the B1 scalar-summary/MLP baseline, and a first structured object foundation slice (ObjectTokenizer -> latent Perceiver -> event embedding -> classification). Training remains limited to feasibility smoke runs; real COLLIDE-V2 validation on LXPLUS is pending.
+Current status: COLLIDE source inspection, the B1 scalar-summary/MLP baseline, and structured object classification (ObjectTokenizer -> latent Perceiver -> event embedding -> classification). A shared streaming runner supports small original Parquet samples and full mounted EOS datasets, with CPU/GPU execution and reports. Real COLLIDE-V2 schema/unit validation and full-scale runs remain to be performed on an authorized CERN node.
 
 ## Install
 
@@ -72,7 +72,7 @@ Current supported backends:
 
 - local tiny Parquet sample
 - Hugging Face materialized subset
-- EOS path on LXPLUS, not yet full-scale vectorization
+- mounted EOS paths on LXPLUS (streaming structured classification; B1 vectorization remains separate)
 
 Docs:
 
@@ -84,6 +84,20 @@ Docs:
 - [HF smoke pipeline](docs/hf_smoke_pipeline.md)
 - [HF multi-process classification](docs/hf_multi_process_classification.md)
 - [Structured foundation smoke: data contract, FullReco/L1T commands, outputs](docs/foundation_smoke.md)
+- [Small/EOS classification: preflight, pilot, full GPU run and reports](docs/classification_run.md)
+
+## Streaming Classification
+
+Use `scripts/run_classification.py` with `configs/runs/classification.yaml` for
+both `--mode small` and `--mode eos`. The stages `inspect`, `train`, `evaluate`
+and `report` cover schema/unit auditing, uniform sampling across files, bounded
+batch construction, CPU/GPU execution and reproducible evaluation. Outputs
+include CSV tables, PNG/PDF figures and a self-contained HTML report.
+
+The EOS root defaults to `/eos/project/f/foundational-model-dataset/samples/`.
+Start with `--stage inspect`; see the [detailed run guide](docs/classification_run.md)
+for exact commands, input contracts, memory controls and the limitations of
+preliminary unweighted results. The existing smoke and B1 paths below remain available.
 
 ## Structured Foundation Smoke
 
@@ -153,11 +167,13 @@ python scripts/run_hf_smoke_pipeline.py --config configs/paths/hf_collide1m.yaml
 
 If `y.npy` exists with at least two classes, training and evaluation can run. If `y.npy` is absent or contains only one class, the HF smoke pipeline still succeeds as X-only or single-class validation.
 
-## EOS Later On LXPLUS
+## B1 EOS Inspection / Vectorization
 
 ```bash
 python scripts/inspect_dataset.py --config configs/paths/eos.yaml
 python scripts/vectorize_collide.py --config configs/paths/eos.yaml
 ```
 
-Real EOS checks are intentionally deferred to LXPLUS. The pploner-style flow is preserved as `Parquet -> vectorized .npy -> preprocessing -> training`.
+The B1 pploner-style flow is preserved as `Parquet -> vectorized .npy -> preprocessing -> training`.
+For structured streaming classification on the full EOS dataset, use the new
+[classification runner](docs/classification_run.md).

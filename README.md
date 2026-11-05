@@ -6,9 +6,53 @@ Current status: COLLIDE source inspection, the B1 scalar-summary/MLP baseline, a
 
 ## Install
 
+Use Python 3.10 or newer. From the repository root:
+
 ```bash
-pip install -e .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install --no-deps -e .
 ```
+
+The requirements file installs portable Python dependencies, including PyTorch,
+pytest and the Hugging Face backend. The final command installs FlowyForge in
+editable mode so scripts can import the package under `src/`.
+For only the core dependencies, use `python -m pip install -e .` instead.
+
+### Linux, LXPLUS and HPC environments
+
+Create the virtual environment on the target system; do not copy a macOS venv
+to Linux or reuse one across incompatible cluster environments. If your site
+uses environment modules, load its Python environment before creating the venv,
+and use the same environment in batch jobs. Module names and available Python
+versions depend on the site.
+
+`requirements.txt` contains no local paths, macOS-only packages, CUDA version or
+custom package index. It can also be installed before the repository is available;
+run the editable project installation once you are in the repository root.
+This is a portable dependency list, not a lock file validated on every cluster.
+
+For GPU use, install the PyTorch build prescribed by your cluster for its driver
+and accelerator environment **before** installing the requirements. The plain
+`torch` requirement accepts an already installed build; it does not select or
+verify a CUDA version. The foundation smoke trainer currently runs on CPU even
+when CUDA is available. Installing a GPU build does not change that behavior.
+
+Check the environment on the node where you will run the workload:
+
+```bash
+python -m pip check
+python -c "import flowyforge, torch, pyarrow; print('PyTorch:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('PyArrow:', pyarrow.__version__)"
+python -m pytest -q tests/
+```
+
+A CPU-only node may correctly report `CUDA available: False`. On clusters
+without outbound network access, install through the site's package mirror or
+an approved wheel directory; dependency installation needs to be completed
+before running offline jobs. EOS access and filesystem mounts are supplied by
+the cluster, not by this requirements file.
 
 ## Test
 

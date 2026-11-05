@@ -1,0 +1,22 @@
+# Portable Python dependencies for local, Linux/LXPLUS and HPC environments.
+# Use a separate virtual environment on each system with Python >= 3.10.
+# python -m pip install -r requirements.txt
+# Install the project separately from the repository root:
+# python -m pip install --no-deps -e .
+# Keep the core dependency names aligned with pyproject.toml.
+# Versions are intentionally not locked to one OS, Python version or accelerator.
+pyyaml
+numpy
+pandas
+pyarrow
+matplotlib
+scikit-learn
+pytest
+
+# Install a site-approved CPU/CUDA build first if the cluster requires one.
+# No CUDA version, custom wheel index or platform-specific package is forced here.
+torch
+
+# Additional dependencies for the Hugging Face data backend and helper scripts.
+datasets
+huggingface_hub

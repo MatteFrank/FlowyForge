@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Create shared partitions, inspect, train, evaluate or report COLLIDE events."""
+"""Create shared partitions, inspect, train, evaluate, report or compare COLLIDE runs."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from pathlib import Path
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/runs/classification.yaml")
-    parser.add_argument("--stage", choices=("partitions", "inspect", "train", "evaluate", "report"), default="train")
+    parser.add_argument("--stage", choices=("partitions", "inspect", "train", "evaluate", "report", "compare"), default="train")
+    parser.add_argument("--run-dir", action="append", help="For compare: repeat for FullReco and L1T training/evaluation directories.")
     parser.add_argument("--partition-manifest", help="Create at --stage partitions; reuse for inspect/train. Path relative to cwd.")
     parser.add_argument("--mode", choices=("small", "eos"))
     parser.add_argument("--process", action="append", metavar="NAME=PATH_OR_GLOB",
@@ -36,6 +37,18 @@ def main() -> int:
     from flowyforge.core.config import load_yaml
 
     try:
+        if args.stage == "compare":
+            from flowyforge.analysis.classification_report import compare_classification_runs
+
+            invalid = [key for key, value in vars(args).items()
+                       if value is not None and key not in {"stage", "config", "run_dir", "output_dir"}]
+            if invalid or not args.run_dir or not args.output_dir:
+                raise ValueError("compare requires two --run-dir paths and --output-dir; no training/evaluation overrides.")
+            compare_classification_runs(args.run_dir, args.output_dir)
+            print(f"Verified comparison: {Path(args.output_dir) / 'comparison.html'}")
+            return 0
+        if args.run_dir:
+            raise ValueError("--run-dir is only used by --stage compare.")
         if args.stage in {"evaluate", "report"}:
             invalid = [name for name in ("mode", "process", "process_name", "max_events_per_class",
                                          "view", "model_config", "epochs", "seed", "partition_manifest") if getattr(args, name) is not None]
@@ -66,7 +79,7 @@ def main() -> int:
             if args.checkpoint:
                 raise ValueError("--checkpoint is only used by --stage evaluate.")
             overrides = {key: value for key, value in vars(args).items()
-                         if value is not None and key not in {"config", "stage", "process", "process_name", "checkpoint"}}
+                         if value is not None and key not in {"config", "stage", "process", "process_name", "checkpoint", "run_dir"}}
             if args.process_name is not None:
                 overrides["process_names"] = args.process_name
             if args.process:

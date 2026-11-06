@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from flowyforge.analysis.classification_report import (
-    compute_confusion_metrics, write_classification_report,
+    EvaluationScoreWriter, compute_binary_metrics, compute_confusion_metrics,
+    read_evaluation_scores, write_classification_report,
 )
 
 
@@ -63,3 +64,83 @@ def test_report_accepts_absent_optional_fields(tmp_path: Path):
     report = write_classification_report({}, tmp_path)
     assert report.exists()
     assert "Preliminary results" in report.read_text(encoding="utf-8")
+
+
+def test_binary_roc_auc_groups_ties_and_never_splits_them_at_operating_point():
+    result = compute_binary_metrics([0.9, 0.8, 0.8, 0.1], [1, 0, 1, 0], signal_label=1,
+                                     background_acceptance=0.5, min_background_events=1)
+    assert result["roc_auc"] == pytest.approx(0.875)
+    assert result["num_signal"] == result["num_background"] == 2
+    assert [(p["false_positive_rate"], p["true_positive_rate"]) for p in result["roc"]] == [(0, 0), (0, .5), (.5, 1), (1, 1)]
+    assert result["operating_point"]["threshold"] == .8
+    assert result["operating_point"]["signal_efficiency"] == 1
+    tied = compute_binary_metrics([.5] * 8, [0, 1] * 4, signal_label=0,
+                                   background_acceptance=.5, min_background_events=1)
+    assert tied["roc_auc"] == .5
+    assert tied["operating_point"]["status"] == "ok"
+    assert tied["operating_point"]["signal_efficiency"] == 0
+    assert tied["operating_point"]["threshold"] is None
+    assert tied["operating_point"]["accepted_background"] == 0
+    assert tied["operating_point"]["tie_limited"]
+    reordered = compute_binary_metrics([.8, .1, .9, .8], [1, 0, 1, 0], signal_label=1,
+                                        background_acceptance=.5, min_background_events=1)
+    assert result == reordered
+
+
+def test_binary_roc_known_rankings_missing_classes_and_low_background_resolution():
+    for scores, auc in (([.9, .8, .2, .1], 1.), ([.1, .2, .8, .9], 0.)):
+        result = compute_binary_metrics(scores, [1, 1, 0, 0], signal_label=1)
+        assert result["roc_auc"] == auc
+        assert result["operating_point"]["signal_efficiency"] is None
+        assert result["operating_point"]["status"] == "insufficient_background_resolution"
+    for labels in ([], [0, 0], [1, 1]):
+        result = compute_binary_metrics([.2] * len(labels), labels, signal_label=1)
+        assert result["roc_auc"] is None
+        assert result["status"] == "missing_class" and result["roc"] == []
+    # A fractional floating-point budget such as .29 * 100 must admit 29 events.
+    scores = [1 - i / 101 for i in range(101)]
+    result = compute_binary_metrics(scores, [0] * 100 + [1], signal_label=1,
+                                     background_acceptance=.29, min_background_events=1)
+    assert result["operating_point"]["accepted_background"] == 29
+    with pytest.raises(ValueError, match="finite"):
+        compute_binary_metrics([float('nan')], [0], signal_label=1)
+    with pytest.raises(ValueError, match="background_acceptance"):
+        compute_binary_metrics([.5], [0], signal_label=1, background_acceptance=0)
+
+
+def test_score_shards_are_bounded_complete_and_protected(tmp_path):
+    context = {"signal_process": "signal", "signal_label": 1}
+    writer = EvaluationScoreWriter(tmp_path, "test", context=context, shard_rows=3)
+    for start in (0, 5):
+        ids = [{"event_id": f"origin-v1:{index:064x}"} for index in range(start, start + 5)]
+        writer.append(ids, [0, 1, 0, 1, 0], [.2, .6, .1, .8, .3])
+        assert len(writer.rows) < 3
+    relative = writer.finish()
+    manifest, ids, labels, scores = read_evaluation_scores(tmp_path / relative)
+    assert manifest["num_rows"] == len(ids) == len(labels) == len(scores) == 10
+    assert [shard["num_rows"] for shard in manifest["shards"]] == [3, 3, 3, 1]
+    with pytest.raises(FileExistsError):
+        EvaluationScoreWriter(tmp_path, "test", context=context)
+    file = tmp_path / "scores/test" / manifest["shards"][0]["path"]
+    file.write_bytes(file.read_bytes() + b"tampered")
+    with pytest.raises(ValueError, match="content changed"):
+        read_evaluation_scores(tmp_path / relative)
+
+
+def test_binary_report_retains_classification_and_exports_roc(tmp_path):
+    binary = compute_binary_metrics([.9, .8, .2, .1], [1, 0, 1, 0], signal_label=1,
+                                     background_acceptance=.01, min_background_events=10)
+    binary.update(signal_process="ttbar", background_process="Wjets")
+    report = write_classification_report({"view": "FullReco", "label_map": {"Wjets": 0, "ttbar": 1},
+        "test": {"confusion_matrix": [[1, 1], [1, 1]], "loss": .5, "binary": binary}}, tmp_path)
+    document = report.read_text()
+    assert "ttbar" in document and "insufficient_background_resolution" in document
+    assert "FullReco" in document
+    assert "not a confidence interval" in document
+    for name in ("roc_test", "confusion_test_counts"):
+        assert (tmp_path / "plots" / (name + ".png")).exists()
+    with (tmp_path / "tables/binary_test.csv").open() as stream:
+        row = next(csv.DictReader(stream))
+        assert row["signal_efficiency"] == ""
+        assert row["num_signal"] == row["num_background"] == "2"
+    assert (tmp_path / "tables/roc_test.csv").exists()

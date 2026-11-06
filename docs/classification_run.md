@@ -7,6 +7,11 @@ Servono **Parquet originali con collections annidate**. Tutti i run usano
 ObjectTokenizer + Perceiver: la pipeline scalare e il vecchio trainer smoke sono
 stati rimossi. I dati e gli output storici non vengono cancellati.
 
+Il [riferimento supervisionato ttbar/W+jets](../README.md#riferimento-supervisionato-ttbar--wjets-da-zero)
+usa `configs/runs/collide_supervised.yaml`: un protocollo comune, due viste e due
+directory distinte. Il README contiene i comandi di ispezione, training,
+valutazione e confronto, con significato delle nuove opzioni `evaluation`.
+
 Schema/unità reali e prestazioni scientifiche su COLLIDE-V2 devono essere
 confermati sul sito. I test sintetici non sostituiscono questa validazione.
 
@@ -217,8 +222,11 @@ il seed, l'algoritmo e i conteggi necessari alla riproduzione.
 La memoria contiene metadati di file/row group, batch di lettura per i processi
 attivi, il buffer di shuffle, il batch del modello e i parametri. Nel pilot ci
 sono anche gli indici del campione limitato. Nessun elenco di tutti gli eventi
-trasformati o delle predizioni viene accumulato. Le metriche sono aggregate da
-loss, conteggi e matrice di confusione.
+trasformati viene accumulato. Nei run legacy le metriche sono aggregate da
+loss, conteggi e matrice di confusione. Con `evaluation.signal_process` si
+scrivono score scalari del checkpoint scelto in shard Parquet limitati da
+`evaluation.score_shard_rows`; ROC esatta e confronto caricano score, label e ID
+in memoria O(N), senza oggetti fisici o tensori di tutti gli eventi.
 
 Per regolare l'uso di risorse:
 
@@ -286,6 +294,8 @@ Questa fase legge solo `metrics.json`, senza training né lettura dei Parquet.
 | `checkpoint.pt` | Parametri del modello selezionato, configurazione e digest del manifest |
 | `history.json` | Training e validazione per epoca, scritto progressivamente |
 | `metrics.json` | Metriche aggregate, per classe e diagnostica |
+| `scores/{validation,test}/` (opzionale) | Score della classe segnale, identità originali, label e split; shard Parquet e manifest con checksum |
+| `tables/binary_*.csv`, `tables/roc_*.csv`, `plots/roc_*.png/.pdf` | Metriche binarie e curve ROC, se `evaluation.signal_process` è configurato |
 | `report.html` | Report autonomo, con immagini incorporate, condivisibile senza server |
 | `tables/*.csv` | Riepilogo, history, metriche per classe, matrici di confusione, supporti e diagnostica |
 | `plots/*.png`, `plots/*.pdf` | Curve di apprendimento, metriche per classe, composizione degli split, confusioni e diagnostica |

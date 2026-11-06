@@ -70,6 +70,7 @@ Parquet nested → manifest/schema/unità → stream di EventBatch con masks
 | `--stage train` | Ripete il preflight, riusa `--partition-manifest` oppure costruisce gli split del run; allena, seleziona la minima validation loss, valuta il test e produce il report |
 | `--stage evaluate` | Ricarica il checkpoint e rivaluta validation/test sugli stessi split del manifest |
 | `--stage report` | Rigenera CSV, figure e HTML da `metrics.json`, senza leggere i Parquet |
+| `--stage compare` | Verifica eventi, split, protocollo e score di due run FullReco/L1T, poi confronta le metriche |
 
 `train` è autonomo rispetto a `inspect`, ma non scarica dati da HF. L'ispezione
 separata consente di verificare classi, schema e unità prima di impegnare risorse.
@@ -522,6 +523,201 @@ deprecazioni Matplotlib/Pillow nella generazione dei PDF.
 python -m pytest tests/test_streaming_collide.py tests/test_sample_preparation.py tests/test_classification_run.py -q
 python -m pytest tests/ -q
 ```
+
+## Riferimento supervisionato ttbar / W+jets, da zero
+
+Il passo 3 usa lo stesso classificatore Perceiver, con due training separati
+FullReco e L1T. **Segnale:** `tt0123j_5f_ckm_LO_MLM_semiLeptonic`.
+**Background:** `WJetsToLNu_13TeV-madgraphMLM-pythia8`.
+Lo score è la probabilità softmax della classe segnale; il suo indice è risolto
+dal nome nella `label_map` e salvato nei risultati (con questi nomi è 1).
+
+La configurazione comune è
+[configs/runs/collide_supervised.yaml](configs/runs/collide_supervised.yaml).
+Si cambiano soltanto `--view` e `--output-dir` fra i due run. Un unico YAML evita
+che due copie degli iperparametri divergano. Ogni output salva comunque la propria
+configurazione risolta. Restano disponibili tutti i comandi e config precedenti.
+
+Il modello è `foundation_tiny`: embedding 64, 16 latenti, 4 heads, 2 layers,
+con le sei collections e i limiti esistenti: PUPPIPart 128, JetPuppiAK4 16,
+Electron 8, MuonTight 8, PhotonTight 8, PUPPIMET 1. Feature, trasformazioni,
+ordinamento, clipping e maschere non cambiano in questo passo. I pesi sono
+inizializzati casualmente da zero; viene registrato `initial_state_sha256`
+per verificare che i due run partano dagli stessi pesi. Non viene caricato un
+checkpoint di pretraining. Il protocollo comune usa seed 42, 3 epoche, batch 16,
+AdamW con learning rate 0.001, weight decay 0.0001 e gradient clipping 1.0.
+Queste impostazioni definiscono il riferimento iniziale; non derivano da tuning
+sul test. Stesso seed e configurazione non garantiscono risultati identici bit
+per bit fra device o versioni di PyTorch.
+
+### Prerequisiti e configurazione
+
+Completare preparazione e partizioni dei passi 1 e 2. Il nuovo config legge gli
+stessi Parquet in `data/processed/collide_pilot` e richiede
+`data/processed/collide_pilot/partitions.json`: non ricrea gli split durante il
+training. Se il manifest non esiste, crearlo una sola volta con il comando dello
+stadio `partitions` sopra. Se si spostano i dati, aggiornare `sources.small.processes`
+e `partition_manifest` nel nuovo YAML. Su EOS/HPC si possono usare percorsi già
+montati o i mapping CLI `--process NOME=PERCORSO`, con gli stessi nomi dei processi
+e lo stesso manifest per entrambe le viste.
+
+Le opzioni aggiuntive sono nella sezione `evaluation` del config:
+
+| Opzione | Default del riferimento ed effetto |
+| --- | --- |
+| `signal_process` | Nome esatto del ttbar semileptonico. Abilita metriche binarie e score persistenti; richiede due classi e partizioni condivise |
+| `background_acceptance` | `0.01`: frazione di background accettato, cioè 1%, non 0.01%. Valore in `(0, 1]` |
+| `min_background_events` | `10`: richiede `floor(N_background × background_acceptance) >= 10` per riportare l'efficienza alla frazione richiesta |
+| `score_shard_rows` | `10000`: massimo numero di righe scalari per shard Parquet; non cambia il batch del modello |
+
+I config precedenti, senza `evaluation.signal_process` o con valore `null`,
+mantengono report, checkpoint e comportamento preesistenti, anche multiclass.
+Le nuove impostazioni di valutazione sono salvate nel checkpoint; lo stadio
+`evaluate` le ricarica dal run, senza sostituirle con quelle di un altro YAML.
+Scegliere frazione di background, epoche e altri iperparametri **prima** di
+consultare il test. Per modificare il protocollo creare un nuovo esperimento e
+usare la validation; non scegliere il protocollo in base al confronto sul test.
+
+### 1. Ispezione delle due viste
+
+Gli stessi comandi funzionano dalla radice su macOS, Linux, Windows e cluster
+dopo l'attivazione della venv. I percorsi dati devono essere leggibili dal nodo.
+
+```text
+python scripts/run_classification.py --config configs/runs/collide_supervised.yaml --stage inspect --view FullReco --output-dir outputs/perceiver/supervised_fullreco
+python scripts/run_classification.py --config configs/runs/collide_supervised.yaml --stage inspect --view L1T --output-dir outputs/perceiver/supervised_l1t
+```
+
+Controllare `preflight.json`: schema, unità assunte o dichiarate, collections
+troncate e campi opzionali. `inspect` non addestra né scrive score. Nel pilot
+da 5.000 eventi per processo gli split attesi sono 3.000 train, 1.000 validation
+e 1.000 test per processo, condivisi fra le viste.
+
+### 2. Training FullReco e 3. training L1T
+
+```text
+python scripts/run_classification.py --config configs/runs/collide_supervised.yaml --stage train --view FullReco --device auto --output-dir outputs/perceiver/supervised_fullreco
+python scripts/run_classification.py --config configs/runs/collide_supervised.yaml --stage train --view L1T --device auto --output-dir outputs/perceiver/supervised_l1t
+```
+
+I due run partono indipendentemente da zero. Il checkpoint scelto minimizza
+esclusivamente la **validation loss**; l'epoca selezionata può essere diversa
+nelle due viste pur usando lo stesso budget di training. Dopo la selezione si
+rivalutano validation e test con i pesi scelti e si salvano score e metriche.
+Accuracy, balanced accuracy, F1, loss, confusion matrix, history e report
+rimangono disponibili. La ROC non modifica la selezione del checkpoint.
+Una directory usata solo per `inspect` può essere riusata da `train`; un training
+iniziato, completato o con score presenti richiede una nuova directory.
+
+### 4. Valutazione indipendente dal training
+
+Il training produce già la valutazione finale. Per ricalcolarla dai checkpoint:
+
+```text
+python scripts/run_classification.py --stage evaluate --checkpoint outputs/perceiver/supervised_fullreco/checkpoint.pt --device auto --output-dir outputs/perceiver/supervised_fullreco_evaluation
+python scripts/run_classification.py --stage evaluate --checkpoint outputs/perceiver/supervised_l1t/checkpoint.pt --device auto --output-dir outputs/perceiver/supervised_l1t_evaluation
+```
+
+Si possono cambiare device, batch size o numero di worker di **valutazione**;
+il protocollo di training originale resta registrato. Per dati spostati aggiungere
+`--data-root NUOVA_RADICE` secondo la procedura del passo 2. Le directory con score
+esistenti non vengono sovrascritte: per un'altra valutazione scegliere un nuovo
+`--output-dir`. Non è implementato il resume del training.
+
+### Score, ROC-AUC ed efficienza del segnale
+
+Per ciascuno split finale, `metrics.json` contiene `binary` con ROC-AUC,
+`num_signal`, `num_background`, curva ROC e `operating_point`. I CSV e le figure
+sono `tables/binary_validation.csv`, `tables/binary_test.csv`,
+`tables/roc_validation.csv`, `tables/roc_test.csv` e `plots/roc_*.png/.pdf`.
+`report.html` integra curve, conteggi, classe segnale e stato della stima.
+
+La ROC usa `FPR = background_accettato / N_background` e
+`TPR = segnale_accettato / N_segnale`. Gli score uguali entrano insieme alla
+stessa soglia: l'ordine delle righe non modifica il risultato. L'AUC esatta
+attribuisce mezzo punto a una coppia segnale/background con score identico.
+L'efficienza riportata è la massima TPR ottenibile con una soglia `score >= soglia`
+che rispetti `FPR <= background_acceptance`. Non si separano artificialmente i
+pareggi e non si interpola l'efficienza fra soglie non realizzabili.
+Per questo la frazione effettivamente accettata può essere inferiore al target;
+vengono salvati soglia, conteggi accettati e frazione raggiunta. Una soglia `null`
+con stato `ok` significa rifiutare tutti gli eventi.
+
+Se manca una classe, ROC/AUC non sono definite (`status: missing_class`). Se il
+budget `floor(N_background × target)` è inferiore a `min_background_events`,
+l'efficienza è `null` con `status: insufficient_background_resolution`;
+ROC e AUC rimangono disponibili quando entrambe le classi sono presenti.
+Con 1.000 background e target 1% il budget è 10; con target 0.1% è soltanto 1.
+Il limite configurato è una protezione sulla risoluzione empirica, non un
+intervallo di confidenza. Zero background osservati dopo un taglio non dimostra
+accettazione nulla nella popolazione. Le soglie del report descrivono la ROC
+del rispettivo split: non sono soglie operative calibrate sulla validation
+e trasferite al test. Il test fornisce una misura finale del protocollo fissato.
+
+Gli score vengono scritti progressivamente, a partire dai batch del modello:
+
+```text
+RUN_DIR/
+  scores/validation/manifest.json
+  scores/validation/part-00000.parquet
+  scores/test/manifest.json
+  scores/test/part-00000.parquet
+```
+
+Ogni riga contiene `event_id`, `label`, `signal_score` e `split`. L'identità rimanda
+alla provenienza originale in `partitions.json`. Il manifest degli score e i
+metadati Parquet registrano classe segnale, label map, vista, digest del checkpoint
+e dei manifest; ogni shard ha conteggio e SHA256. Gli score sono quelli del
+checkpoint selezionato, non predizioni accumulate durante l'ottimizzazione.
+Non si conservano in memoria oggetti fisici o tensori dell'intero dataset.
+Il buffer di scrittura contiene al massimo `score_shard_rows` record scalari.
+Il calcolo esatto della ROC e il confronto rileggono però **score, label e ID
+scalari di uno split in memoria**, con ordinamento O(N log N) e memoria O(N);
+non è implementato un ordinamento su disco per dataset arbitrariamente grandi.
+
+### 5. Confronto FullReco / L1T
+
+```text
+python scripts/run_classification.py --stage compare --run-dir outputs/perceiver/supervised_fullreco_evaluation --run-dir outputs/perceiver/supervised_l1t_evaluation --output-dir outputs/perceiver/supervised_comparison
+```
+
+Si possono passare direttamente le due directory di training se non è stata
+eseguita la valutazione separata. Il confronto legge gli artifact salvati e
+non apre i Parquet fisici né ricarica il modello. Prima di confrontare metriche:
+
+- verifica checksum e identità di tutte le partizioni, inclusi gli eventi train;
+- controlla che gli score validation/test coprano esattamente gli eventi attesi,
+  senza duplicati e con label corrette;
+- richiede una vista FullReco e una L1T, stessa architettura, reader salvo vista,
+  seed, protocollo di training e pesi iniziali;
+- verifica la stessa definizione di segnale e punto operativo, poi ricalcola
+  le metriche binarie dagli shard per controllare quelle registrate.
+
+Differenze nei dati, nelle appartenenze, nelle label o nel protocollo causano
+errore prima della produzione del confronto. Device, thread CPU e frequenza dei
+log possono differire; il numero di worker del training fa parte del protocollo
+perché influenza l'ordine degli eventi. `comparison.json`, `comparison.csv` e
+`comparison.html` mostrano accuracy, F1, AUC, efficienza, conteggi e stato della
+stima per entrambe le viste. Il confronto non sceglie automaticamente un modello
+o iperparametri e rifiuta output già popolati.
+
+Verifiche effettivamente eseguite per il passo 3: **84 test passati** con
+`python -m pytest tests/ -q`, inclusi pareggi degli score, classi mancanti,
+statistica insufficiente, shard limitati/protetti, rivalutazione e rifiuto di
+confronti con eventi o impostazioni differenti. I warning sono deprecazioni
+Matplotlib/Pillow nella generazione dei PDF.
+
+È stato eseguito anche uno smoke CLI separato su **20 eventi sintetici per
+classe**, con tutte le collections e l'architettura `foundation_tiny` del
+riferimento, un'epoca CPU per vista: ispezione, due training, due rivalutazioni
+e confronto. Gli output sono sotto `outputs/perceiver/supervised_smoke/`, con
+config usato in `config.yaml` e confronto in `comparison/comparison.html`.
+I due run hanno gli stessi pesi iniziali e 24/8/8 eventi complessivi per
+train/validation/test. L'efficienza al target 1% è correttamente non stimabile
+con soli quattro background nel test. I nomi ttbar/W+jets dello smoke sono
+etichette di fixture sintetiche: quelle metriche non misurano prestazioni
+fisiche. **Il training sul pilot reale non è stato avviato**, né sono stati
+eseguiti training su GPU o EOS in questo passo.
 
 ## EOS/LXPLUS o altro filesystem HPC
 

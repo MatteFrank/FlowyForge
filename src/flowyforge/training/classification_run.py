@@ -20,8 +20,10 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from flowyforge.analysis.classification_report import (
-    compute_confusion_metrics, write_classification_report,
+    EvaluationScoreWriter, compute_binary_metrics, compute_confusion_metrics,
+    read_evaluation_scores, write_classification_report,
 )
+from flowyforge.data_plugins.collide_v2.provenance import sha256_file
 from flowyforge.core.config import load_yaml
 from flowyforge.core.typing import EventBatch, ObjectGroup
 from flowyforge.data_plugins.collide_v2.object_dataset import (
@@ -48,7 +50,7 @@ def load_run_config(path: str | Path, overrides: Mapping[str, Any] | None = None
     path = Path(path).expanduser().resolve()
     raw = load_yaml(path)
     overrides = dict(overrides or {})
-    _known(raw, {"mode", "model_config", "output_dir", "seed", "sources", "data", "training", "partition_manifest"}, "run")
+    _known(raw, {"mode", "model_config", "output_dir", "seed", "sources", "data", "training", "partition_manifest", "evaluation"}, "run")
     _known(overrides, {"mode", "processes", "data_root", "process_names", "max_events_per_class",
                        "view", "device", "epochs", "batch_size", "num_workers", "seed",
                        "output_dir", "model_config", "partition_manifest"}, "override")
@@ -129,8 +131,21 @@ def load_run_config(path: str | Path, overrides: Mapping[str, Any] | None = None
         if not isinstance(partition_path, (str, Path)) or not str(partition_path).strip():
             raise ValueError("partition_manifest must be a nonempty path or null.")
         partition_path = str(Path(partition_path).expanduser())
+    evaluation = {"signal_process": None, "background_acceptance": 0.01,
+                  "min_background_events": 10, "score_shard_rows": 10000, **raw.get("evaluation", {})}
+    _known(evaluation, {"signal_process", "background_acceptance", "min_background_events", "score_shard_rows"}, "evaluation")
+    signal = evaluation["signal_process"]
+    if signal is not None and (not isinstance(signal, str) or not signal.strip()):
+        raise ValueError("evaluation.signal_process must be a nonempty class name or null.")
+    fraction = evaluation["background_acceptance"]
+    if isinstance(fraction, bool) or not math.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError("evaluation.background_acceptance must be in (0, 1].")
+    for key in ("min_background_events", "score_shard_rows"):
+        _positive_integer(evaluation[key], "evaluation." + key)
+    if signal is not None and partition_path is None:
+        raise ValueError("Binary evaluation requires partition_manifest for stable event identities.")
     return {"mode": mode, "source": source, "model": model, "data": data, "training": training,
-            "partition_manifest": partition_path,
+            "partition_manifest": partition_path, "evaluation": evaluation,
             "seed": seed, "output_dir": str(Path(overrides.get("output_dir", raw.get("output_dir", "outputs/classification"))).expanduser()),
             "config_path": str(path), "model_config_path": str(model_path.resolve())}
 
@@ -201,8 +216,11 @@ def _update_diagnostics(diagnostics: dict[str, Any], batch: EventBatch) -> None:
 def _run_epoch(model: EventClassificationModel, loader: DataLoader, device: torch.device,
                label_map: dict[str, int], *, optimizer: torch.optim.Optimizer | None = None,
                gradient_clip_norm: float = 1.0, log_every_batches: int = 100,
-               description: str = "evaluation", diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
+               description: str = "evaluation", diagnostics: dict[str, Any] | None = None,
+               score_writer: EvaluationScoreWriter | None = None) -> dict[str, Any]:
     training = optimizer is not None
+    if training and score_writer is not None:
+        raise ValueError("Persisted evaluation scores must use a frozen selected checkpoint, not training batches.")
     model.train(training)
     confusion = torch.zeros((len(label_map), len(label_map)), dtype=torch.long, device=device)
     loss_sum, count = 0.0, 0
@@ -223,6 +241,11 @@ def _run_epoch(model: EventClassificationModel, loader: DataLoader, device: torc
                 nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm, error_if_nonfinite=True)
                 optimizer.step()
             predicted = logits.detach().argmax(dim=-1)
+            if score_writer is not None:
+                signal_label = score_writer.context["signal_label"]
+                # Float64 on CPU also works with MPS (which lacks float64 tensors).
+                scores = logits.detach().cpu().double().softmax(dim=-1)[:, signal_label]
+                score_writer.append(cpu_batch.metadata["events"], cpu_batch.targets.numpy(), scores.cpu().numpy())
             # bincount is accumulated on CPU for MPS, whose support is limited.
             flat = batch.targets * len(label_map) + predicted
             if device.type == "mps":
@@ -238,6 +261,63 @@ def _run_epoch(model: EventClassificationModel, loader: DataLoader, device: torc
         raise ValueError(f"Empty {description} split. Increase the sample or adjust split fractions.")
     result = compute_confusion_metrics(confusion.cpu().tolist(), label_map)
     result.update(loss=loss_sum / count, duration_seconds=time.monotonic() - started)
+    return result
+
+
+def _training_protocol(config):
+    """Comparable scientific settings; runtime placement/logging can differ."""
+    return {"seed": config["seed"], "model": config["model"],
+            "data": {key: value for key, value in config["data"].items() if key != "view"},
+            "training": {key: value for key, value in config["training"].items()
+                         if key not in {"device", "cpu_threads", "log_every_batches"}},
+            "collection_feature_dims": collection_feature_dims(default_collection_specs(config["data"]["collection_limits"]))}
+
+
+def _initial_state_digest(model):
+    digest = hashlib.sha256()
+    for name, value in sorted(model.state_dict().items()):
+        digest.update(name.encode())
+        digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _binary_settings(config, manifest):
+    settings = config.get("evaluation", {})
+    signal = settings.get("signal_process")
+    if signal is None:
+        return None
+    if len(manifest["label_map"]) != 2 or signal not in manifest["label_map"]:
+        raise ValueError("Binary evaluation requires exactly two classes and an explicit signal_process in label_map.")
+    if manifest["version"] != 2:
+        raise ValueError("Binary evaluation requires shared partitions (dataset manifest v2).")
+    return settings
+
+
+def _evaluate_split(model, loader, device, manifest, config, split, output, metrics):
+    settings = _binary_settings(config, manifest)
+    writer = None
+    if settings:
+        signal = settings["signal_process"]
+        context = {key: metrics[key] for key in ("partition_sha256", "dataset_manifest_sha256", "checkpoint_sha256", "view")}
+        context.update(signal_process=signal, signal_label=manifest["label_map"][signal], label_map=manifest["label_map"])
+        writer = EvaluationScoreWriter(output, split, context=context, shard_rows=settings["score_shard_rows"])
+    result = _run_epoch(model, loader, device, manifest["label_map"],
+                        log_every_batches=config["training"]["log_every_batches"], description=f"best model {split}",
+                        diagnostics=metrics["diagnostics"], score_writer=writer)
+    if writer:
+        result["score_manifest"] = writer.finish()
+        _, ids, labels, scores = read_evaluation_scores(Path(output) / result["score_manifest"])
+        expected = {}
+        for process in manifest["processes"]:
+            keys = [key for info in process["files"] for key in info["event_ids"]]
+            expected.update((keys[index], process["label"]) for index in process["split_indices"][split])
+        if dict(zip(ids, labels.tolist())) != expected:
+            raise ValueError(f"Evaluation score identities/labels differ from the {split} partition.")
+        binary = compute_binary_metrics(scores, labels, signal_label=writer.context["signal_label"],
+                    background_acceptance=settings["background_acceptance"], min_background_events=settings["min_background_events"])
+        binary.update(signal_process=settings["signal_process"],
+                      background_process=next(name for name in manifest["label_map"] if name != settings["signal_process"]))
+        result["binary"] = binary
     return result
 
 
@@ -329,7 +409,7 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
     directory is protected from accidental reuse; choose a new output directory.
     """
     output = Path(config["output_dir"])
-    if any((output / name).exists() for name in ("checkpoint.pt", "history.json", "metrics.json")):
+    if any((output / name).exists() for name in ("checkpoint.pt", "history.json", "metrics.json", "scores")):
         raise FileExistsError(f"Refusing to overwrite an existing run: {output}. Choose a new --output-dir.")
     device = resolve_device(config["training"]["device"]) if not inspect_only else torch.device("cpu")
     output.mkdir(parents=True, exist_ok=True)
@@ -347,6 +427,7 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
         manifest = build_manifest(config["source"], seed=config["seed"],
                                   validation_fraction=config["data"]["validation_fraction"],
                                   test_fraction=config["data"]["test_fraction"], **reader)
+    _binary_settings(config, manifest)
     preflight = inspect_dataset(manifest, audit_events_per_class=config["data"]["audit_events_per_class"],
                                 **_reader_settings(config))
     _write_json(output / "dataset_manifest.json", manifest)
@@ -371,6 +452,8 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
     diagnostics: dict[str, Any] = {"scope": "all selected rows once: first train epoch, final validation and test"}
     first_train = None
     metrics = _base_metrics(config, manifest, preflight, device)
+    metrics.update(initialization="random_from_scratch", initial_state_sha256=_initial_state_digest(model),
+                   training_protocol=_training_protocol(config))
     for epoch in range(1, settings["epochs"] + 1):
         started = time.monotonic()
         loaders["train"].dataset.set_epoch(epoch)
@@ -393,6 +476,7 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
             temporary = output / "checkpoint.pt.tmp"
             torch.save({"format_version": 1, "model_state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
                         "config": config, "label_map": manifest["label_map"], "best_epoch": best_epoch,
+                        **{key: metrics[key] for key in ("initialization", "initial_state_sha256", "training_protocol")},
                         "dataset_manifest_sha256": metrics["dataset_manifest_sha256"],
                         "collection_feature_dims": collection_feature_dims(default_collection_specs(config["data"]["collection_limits"]))}, temporary)
             temporary.replace(output / "checkpoint.pt")
@@ -400,10 +484,9 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
     checkpoint = torch.load(output / "checkpoint.pt", map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     metrics.update(history=history, best_epoch=best_epoch, diagnostics=diagnostics)
+    metrics["checkpoint_sha256"] = sha256_file(output / "checkpoint.pt")
     for split in ("validation", "test"):
-        metrics[split] = _run_epoch(model, loaders[split], device, manifest["label_map"],
-                                    log_every_batches=settings["log_every_batches"], description=f"best model {split}",
-                                    diagnostics=diagnostics)
+        metrics[split] = _evaluate_split(model, loaders[split], device, manifest, config, split, output, metrics)
     _record_split_counts(metrics, first_train)
     _finish_diagnostics(diagnostics)
     _write_json(output / "metrics.json", metrics)
@@ -417,7 +500,7 @@ def evaluate_run(checkpoint_path: str | Path, *, output_dir: str | Path,
     """Evaluate the checkpoint on its frozen validation/test rows, never resplit."""
     checkpoint_path = Path(checkpoint_path).expanduser()
     output = Path(output_dir).expanduser()
-    if any((output / name).exists() for name in ("checkpoint.pt", "history.json")):
+    if any((output / name).exists() for name in ("checkpoint.pt", "history.json", "scores")):
         raise FileExistsError(f"Evaluation output contains an existing training run: {output}. Choose a separate directory.")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if checkpoint.get("format_version") != 1:
@@ -449,13 +532,14 @@ def evaluate_run(checkpoint_path: str | Path, *, output_dir: str | Path,
     model.load_state_dict(checkpoint["model_state_dict"])
     preflight = json.loads((checkpoint_path.parent / "preflight.json").read_text(encoding="utf-8"))
     metrics = _base_metrics(config, manifest, preflight, resolved_device)
+    metrics.update({key: checkpoint.get(key) for key in ("initialization", "initial_state_sha256", "training_protocol")})
+    metrics["checkpoint_sha256"] = sha256_file(checkpoint_path)
     history_path = checkpoint_path.parent / "history.json"
     metrics.update(best_epoch=checkpoint["best_epoch"], history=json.loads(history_path.read_text()) if history_path.exists() else [],
                    checkpoint_path=str(checkpoint_path.resolve()), diagnostics={"scope": "validation and test rows only"})
     for split in ("validation", "test"):
-        metrics[split] = _run_epoch(model, _loader(manifest, config, split), resolved_device, manifest["label_map"],
-                                    log_every_batches=config["training"]["log_every_batches"], description=split,
-                                    diagnostics=metrics["diagnostics"])
+        metrics[split] = _evaluate_split(model, _loader(manifest, config, split), resolved_device,
+                                        manifest, config, split, output, metrics)
     _record_split_counts(metrics)
     _finish_diagnostics(metrics["diagnostics"])
     output.mkdir(parents=True, exist_ok=True)

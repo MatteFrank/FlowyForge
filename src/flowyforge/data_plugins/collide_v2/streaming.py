@@ -1,7 +1,7 @@
 """Frozen Parquet inventories, uniform samples and bounded COLLIDE event streams.
 
-Full runs store file/row-group metadata, never an index for every event. A seeded
-permutation assigns exact, disjoint per-class splits without materializing it.
+Legacy full runs store row-group metadata and an implicit seeded permutation.
+Opt-in portable partitions store explicit event identities, independent of view.
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ import json
 import math
 import os
 import random
+from datetime import date, datetime, time
+from decimal import Decimal
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,9 @@ import pyarrow.parquet as pq
 from torch.utils.data import IterableDataset, get_worker_info
 
 from flowyforge.core.typing import EventBatch
+from flowyforge.data_plugins.collide_v2.provenance import (
+    ORIGIN_COLUMNS, event_id, logical_origin, pop_origin, provenance_columns, sha256_file,
+)
 from flowyforge.data_plugins.collide_v2.object_dataset import (
     _object_values, default_collection_specs, expand_parquet_paths, required_columns, row_to_event_batch,
 )
@@ -170,7 +175,18 @@ def _schema_info(schema: pa.Schema, reader: dict[str, Any], path: Path) -> dict[
             if declared is not None and aliases.get(str(declared).strip().lower()) != effective:
                 raise ValueError(f"{path}: unit metadata for {column} is {declared!r}, configured {effective!r}.")
             unit_info[column] = {"unit": effective, "status": "metadata" if declared is not None else "assumed"}
-    return {"columns": columns, "missing_optional_columns": sorted(set(requested) - set(schema.names)), "units": unit_info}
+    result = {"columns": columns, "missing_optional_columns": sorted(set(requested) - set(schema.names)), "units": unit_info}
+    if origins := provenance_columns(schema):
+        result["provenance_columns"] = origins
+    return result
+
+
+def _split_counts(count: int, validation_fraction: float, test_fraction: float) -> dict[str, int]:
+    if count < 3:
+        raise ValueError(f"Only {count} selected events; at least 3 per process are required for nonempty splits.")
+    validation = min(max(1, int(count * validation_fraction)), count - 2)
+    test = min(max(1, int(count * test_fraction)), count - validation - 1)
+    return {"train": count - validation - test, "validation": validation, "test": test}
 
 
 def build_manifest(source: Mapping[str, Any], *, seed=42, validation_fraction=0.2,
@@ -205,9 +221,7 @@ def build_manifest(source: Mapping[str, Any], *, seed=42, validation_fraction=0.
         if count < 3:
             raise ValueError(f"Process {name} has {count} selected events; at least 3 are required.")
         selected = sorted(random.Random(_seed(seed, name + ':sample')).sample(range(total), count)) if count < total else None
-        validation = min(max(1, int(count * validation_fraction)), count - 2)
-        test = min(max(1, int(count * test_fraction)), count - validation - 1)
-        splits = {"train": count - validation - test, "validation": validation, "test": test}
+        splits = _split_counts(count, validation_fraction, test_fraction)
         manifest["processes"].append({"name": name, "label": label, "files": files, "num_rows": total,
                                       "selected_rows": count, "selected_indices": selected,
                                       "permutation_key": _seed(seed, name + ':split'), "split_counts": splits})
@@ -218,10 +232,266 @@ def build_manifest(source: Mapping[str, Any], *, seed=42, validation_fraction=0.
     return manifest
 
 
+PARTITION_ALGORITHM = "stable-origin-uniform-cap-feistel6-v1"
+SPLITS = ("train", "validation", "test")
+
+
+def _json_digest(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     default=_json_value).encode()).hexdigest()
+
+
+def _json_value(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, bytes):
+        return {"bytes": value.hex()}
+    if isinstance(value, (date, datetime, time, Decimal)):
+        return {type(value).__name__: str(value)}
+    raise TypeError(f"Unsupported Parquet value for content fingerprint: {type(value).__name__}")
+
+
+def _field_signature(field):
+    # Ignore Arrow's incidental list child name (item/element), not value types.
+    dtype = field.type
+    if pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_fixed_size_list(dtype):
+        kind = "large_list" if pa.types.is_large_list(dtype) else "list"
+        signature = [kind, getattr(dtype, "list_size", None), _field_signature(dtype.value_field)[1:]]
+    elif pa.types.is_struct(dtype):
+        signature = ["struct", sorted((_field_signature(child) for child in dtype), key=lambda x: x[0])]
+    else:
+        signature = str(dtype)
+    return [field.name, signature, field.nullable,
+            sorted((key.hex(), value.hex()) for key, value in (field.metadata or {}).items())]
+
+
+def _scan_partition_source(source, *, read_batch_size=4, cached=None):
+    """Read all raw columns once; byte-identical files may reuse verified records.
+
+    Row fingerprints exclude only reserved origins. They include raw schema and
+    metadata, so re-encoding/reordering is accepted but dropped fields are not.
+    """
+    if type(read_batch_size) is not int or read_batch_size < 1:
+        raise ValueError("read_batch_size must be a positive integer.")
+    result, seen = [], set()
+    cache = {process["name"]: process for process in (cached or {}).get("processes", [])}
+    for name, paths in _resolve_processes(source).items():
+        previous = cache.get(name, {})
+        known_files = {info["sha256"]: info for info in previous.get("files", [])}
+        known_events = {event["id"]: event for event in previous.get("events", [])}
+        events, files = [], []
+        for path in paths:
+            print(f"  Checking partition source: {name}/{path.name}", flush=True)
+            before = path.stat()
+            digest = sha256_file(path)
+            records = []
+            with pq.ParquetFile(path) as parquet:
+                provenance_columns(parquet.schema_arrow)
+                if digest in known_files:
+                    records = [dict(known_events[key]) for key in known_files[digest]["event_ids"]]
+                else:
+                    schema = parquet.schema_arrow
+                    signature = {
+                        "fields": sorted((_field_signature(field) for field in schema
+                                          if field.name not in ORIGIN_COLUMNS), key=lambda x: x[0]),
+                        "metadata": sorted((key.hex(), value.hex()) for key, value in (schema.metadata or {}).items()),
+                    }
+                    schema_digest = _json_digest(signature)
+                    row_index = 0
+                    for batch in parquet.iter_batches(batch_size=read_batch_size, use_threads=False):
+                        for row in batch.to_pylist():
+                            origin = pop_origin(row) or {"source": "local", "revision": None,
+                                "process": name, "file": "sha256:" + digest, "row": row_index, "sha256": digest}
+                            if origin["process"] != name:
+                                raise ValueError(f"Origin process {origin['process']!r} differs from assigned process {name!r}.")
+                            records.append({"id": event_id(origin), "origin": logical_origin(origin),
+                                            "content_sha256": _json_digest([schema_digest, row])})
+                            row_index += 1
+                            if row_index % 1000 == 0:
+                                print(f"    Fingerprinted {row_index:,}/{parquet.metadata.num_rows:,} rows", flush=True)
+                if len(records) != parquet.metadata.num_rows:
+                    raise ValueError(f"Cached partition row count differs: {path}")
+            after = path.stat()
+            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                raise ValueError(f"Source file changed during partition scan: {path}")
+            ids = [event["id"] for event in records]
+            if len(set(ids)) != len(ids) or seen.intersection(ids):
+                raise ValueError(f"Duplicate event identity in partition source: {path}")
+            seen.update(ids)
+            files.append({"sha256": digest, "size_bytes": before.st_size, "num_rows": len(ids), "event_ids": ids})
+            events.extend(records)
+            print(f"  Partition inventory {name}: {path.name}, {len(ids):,} rows", flush=True)
+        result.append({"name": name, "paths": paths, "files": files,
+                       "events": sorted(events, key=lambda event: event["id"])})
+    return result
+
+
+def create_partition_manifest(source: Mapping[str, Any], *, seed=42, validation_fraction=0.2,
+                              test_fraction=0.2, read_batch_size=4) -> dict[str, Any]:
+    """Freeze source-row memberships once, without a view or object reader.
+
+    The current COLLIDE reader has no verified physical-ID contract. Identity is
+    therefore original logical source/process/file/row (with revision/hash),
+    never an inferred run/event column or an absolute cache path.
+    """
+    if type(seed) is not int or seed < 0:
+        raise ValueError("seed must be a nonnegative integer.")
+    if any(not math.isfinite(value) or value <= 0 for value in (validation_fraction, test_fraction)) or validation_fraction + test_fraction >= 1:
+        raise ValueError("Split fractions must be positive and sum to less than one.")
+    cap = source.get("max_events_per_class")
+    if cap is not None and (type(cap) is not int or cap < 3):
+        raise ValueError("max_events_per_class must be >= 3 or null.")
+    processes = _scan_partition_source(source, read_batch_size=read_batch_size)
+    manifest = {"kind": "flowyforge.event_partitions", "version": 1, "algorithm": PARTITION_ALGORITHM,
+                "identity": "origin-v1", "physical_deduplication": False, "seed": seed,
+                "validation_fraction": validation_fraction, "test_fraction": test_fraction,
+                "max_events_per_class": cap, "processes": processes, "label_map": {},
+                "split_counts": dict.fromkeys(SPLITS, 0)}
+    for label, process in enumerate(processes):
+        process.pop("paths")  # Physical locations never enter the portable artifact.
+        process["files"].sort(key=lambda info: info["sha256"])
+        name, events = process["name"], process["events"]
+        total = len(events)
+        count = min(total, cap) if cap is not None else total
+        counts = _split_counts(count, validation_fraction, test_fraction)
+        selected = sorted(random.Random(_seed(seed, name + ':sample')).sample(range(total), count)) if count < total else range(total)
+        ranks = _permuted_ranks(np.arange(count), count, _seed(seed, name + ':split'))
+        for event in events:
+            event["split"] = None
+        for index, rank in zip(selected, ranks):
+            events[index]["split"] = ("train" if rank < counts["train"] else
+                                      "validation" if rank < counts["train"] + counts["validation"] else "test")
+        process.update(label=label, num_rows=total, selected_rows=count, split_counts=counts)
+        manifest["label_map"][name] = label
+        for split in SPLITS:
+            manifest["split_counts"][split] += counts[split]
+    manifest["sha256"] = _json_digest(manifest)
+    validate_partition_manifest(manifest)
+    return manifest
+
+
+def validate_partition_manifest(manifest):
+    """Reject unknown versions, damaged identities, counts or memberships."""
+    if not isinstance(manifest, dict) or (manifest.get("kind"), manifest.get("version"), manifest.get("algorithm")) != (
+        "flowyforge.event_partitions", 1, PARTITION_ALGORITHM
+    ):
+        raise ValueError("Unsupported partition manifest kind/version/algorithm; create a separate v1 partition manifest.")
+    if manifest.get("sha256") != _json_digest({key: value for key, value in manifest.items() if key != "sha256"}):
+        raise ValueError("Partition manifest checksum mismatch; do not edit saved memberships.")
+    try:
+        seen, totals, labels = set(), dict.fromkeys(SPLITS, 0), {}
+        if manifest["identity"] != "origin-v1" or manifest["physical_deduplication"] is not False:
+            raise ValueError("Unsupported partition identity policy.")
+        if type(manifest["seed"]) is not int or manifest["seed"] < 0:
+            raise ValueError("Invalid partition seed.")
+        vf, tf, cap = manifest["validation_fraction"], manifest["test_fraction"], manifest["max_events_per_class"]
+        if any(not math.isfinite(x) or x <= 0 for x in (vf, tf)) or vf + tf >= 1:
+            raise ValueError("Invalid partition fractions.")
+        if cap is not None and (type(cap) is not int or cap < 3):
+            raise ValueError("Invalid partition sample cap.")
+        for label, process in enumerate(manifest["processes"]):
+            ids, counts = set(), dict.fromkeys(SPLITS, 0)
+            if process["label"] != label or process["name"] in labels:
+                raise ValueError("Invalid partition label mapping.")
+            labels[process["name"]] = label
+            for event in process["events"]:
+                key = event["id"]
+                if key in seen or key != event_id(event["origin"]) or event["origin"]["process"] != process["name"]:
+                    raise ValueError("Duplicate or invalid partition event identity.")
+                if len(event["content_sha256"]) != 64 or any(c not in "0123456789abcdef" for c in event["content_sha256"]):
+                    raise ValueError("Invalid partition event fingerprint.")
+                seen.add(key)
+                ids.add(key)
+                if event["split"] is not None:
+                    counts[event["split"]] += 1
+            selected = min(len(ids), cap) if cap is not None else len(ids)
+            if (process["num_rows"] != len(ids) or process["selected_rows"] != selected or
+                counts != process["split_counts"] or counts != _split_counts(selected, vf, tf)):
+                raise ValueError("Inconsistent partition split counts.")
+            file_ids = []
+            for info in process["files"]:
+                if (len(info["event_ids"]) != info["num_rows"] or info["size_bytes"] < 0 or
+                    len(info["sha256"]) != 64 or any(c not in "0123456789abcdef" for c in info["sha256"])):
+                    raise ValueError("Invalid partition file inventory.")
+                file_ids.extend(info["event_ids"])
+            if len(file_ids) != len(ids) or set(file_ids) != ids:
+                raise ValueError("Partition file inventory differs from event identities.")
+            for split in SPLITS:
+                totals[split] += counts[split]
+        if len(labels) < 2 or labels != manifest["label_map"] or totals != manifest["split_counts"]:
+            raise ValueError("Invalid partition process counts/labels.")
+    except (KeyError, TypeError, AttributeError) as exc:
+        raise ValueError(f"Malformed partition manifest: {exc}") from exc
+
+
+def save_partition_manifest(manifest, path):
+    """Exclusive creation: partitions are immutable experiment artifacts."""
+    validate_partition_manifest(manifest)
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, allow_nan=False)
+        handle.write("\n")
+
+
+def load_partition_manifest(path):
+    manifest = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    validate_partition_manifest(manifest)
+    return manifest
+
+
+def bind_partition_manifest(partitions, source, *, read_batch_size=4, **reader_settings):
+    """Resolve immutable memberships onto current files and one object view.
+
+    Re-exports must contain the same complete event universe and raw payloads.
+    No RNG or sampling runs here. A binding is disposable; partitions are not.
+    """
+    validate_partition_manifest(partitions)
+    cap = source.get("max_events_per_class")
+    if cap is not None and cap != partitions["max_events_per_class"]:
+        raise ValueError("Sample cap differs from partition manifest; remove the override or use its original cap.")
+    current = _scan_partition_source(source, read_batch_size=read_batch_size, cached=partitions)
+    if [p["name"] for p in current] != [p["name"] for p in partitions["processes"]]:
+        raise ValueError("Partition source processes changed.")
+    reader = _reader_config(**reader_settings)
+    binding = {"version": 2, "algorithm": "partition-binding-v1", "seed": partitions["seed"],
+               "partition_sha256": partitions["sha256"], "reader": reader,
+               "validation_fraction": partitions["validation_fraction"], "test_fraction": partitions["test_fraction"],
+               "label_map": dict(partitions["label_map"]), "split_counts": dict(partitions["split_counts"]), "processes": []}
+    task_id = 0
+    for stored, actual in zip(partitions["processes"], current):
+        expected = {event["id"]: event for event in stored["events"]}
+        found = {event["id"]: event for event in actual["events"]}
+        if expected.keys() != found.keys():
+            raise ValueError(f"Partition source identities changed for {stored['name']}: missing/extra original rows.")
+        if any(event["content_sha256"] != found[key]["content_sha256"] for key, event in expected.items()):
+            raise ValueError(f"Partition source content/schema changed for {stored['name']}.")
+        files, indices, total = [], {split: [] for split in SPLITS}, 0
+        for path, inventory in zip(actual["paths"], actual["files"]):
+            stat = path.stat()
+            with pq.ParquetFile(path) as parquet:
+                info = _schema_info(parquet.schema_arrow, reader, path)
+                groups = [parquet.metadata.row_group(i).num_rows for i in range(parquet.num_row_groups)]
+                files.append({**inventory, **info, "path": str(path), "offset": total,
+                              "mtime_ns": stat.st_mtime_ns, "row_groups": groups, "task_offset": task_id})
+                task_id += len(groups)
+            for row_index, key in enumerate(inventory["event_ids"]):
+                split = expected[key]["split"]
+                if split is not None:
+                    indices[split].append(total + row_index)
+            total += inventory["num_rows"]
+        binding["processes"].append({"name": stored["name"], "label": stored["label"], "files": files,
+            "num_rows": total, "selected_rows": stored["selected_rows"], "split_counts": dict(stored["split_counts"]),
+            "selected_indices": sorted(index for values in indices.values() for index in values), "split_indices": indices})
+    return binding
+
+
 def _check_file(info: dict[str, Any]) -> None:
     stat = Path(info["path"]).stat()
     if stat.st_size != info["size_bytes"] or stat.st_mtime_ns != info["mtime_ns"]:
         raise ValueError(f"Source file changed since manifest creation: {info['path']}")
+    if "sha256" in info and sha256_file(info["path"]) != info["sha256"]:
+        raise ValueError(f"Source file content changed since partition binding: {info['path']}")
 
 
 def _raw_stats(row: dict[str, Any]) -> dict[str, Any]:
@@ -262,6 +532,9 @@ def _tasks(process, worker_id=0, num_workers=1):
 def _iter_process(process, tasks, split, reader, read_batch_size, *, audit=False, selected_override=None):
     specs = default_collection_specs(reader["collection_limits"])
     selected = process["selected_indices"] if selected_override is None else selected_override
+    explicit_split = split is not None and "split_indices" in process
+    if explicit_split:
+        selected = process["split_indices"][split]
     checked = set()
     for info, group, offset, size in tasks:
         start = info["offset"] + offset
@@ -273,7 +546,7 @@ def _iter_process(process, tasks, split, reader, read_batch_size, *, audit=False
         with pq.ParquetFile(info["path"]) as parquet:
             local = offset
             for batch in parquet.iter_batches(batch_size=read_batch_size, row_groups=[group],
-                                               columns=list(info["columns"]), use_threads=False):
+                                               columns=list(info["columns"]) + info.get("provenance_columns", []), use_threads=False):
                 global_start = info["offset"] + local
                 if selected is None:
                     indices = np.arange(global_start, global_start + len(batch), dtype=np.int64)
@@ -284,7 +557,7 @@ def _iter_process(process, tasks, split, reader, read_batch_size, *, audit=False
                     indices = np.asarray(selected[lower:upper], dtype=np.int64)
                     positions = indices - global_start
                     sample_positions = np.arange(lower, upper, dtype=np.int64)
-                if split is not None and len(indices):
+                if split is not None and not explicit_split and len(indices):
                     ranks = _permuted_ranks(sample_positions, process["selected_rows"], process["permutation_key"])
                     train_end = process["split_counts"]["train"]
                     validation_end = train_end + process["split_counts"]["validation"]
@@ -295,10 +568,20 @@ def _iter_process(process, tasks, split, reader, read_batch_size, *, audit=False
                     rows = batch.take(pa.array(positions)).to_pylist()
                     for index, row in zip(indices, rows):
                         try:
+                            origin = pop_origin(row)
                             event = _convert_row(row, reader, specs, process["label"])
                         except ValueError as exc:
                             raise ValueError(f"{info['path']}, row {int(index) - info['offset']}: {exc}") from exc
                         event.metadata.update(source_file=info["path"], source_row=int(index) - info["offset"], process_name=process["name"])
+                        if origin is None and "event_ids" in info:
+                            origin = {"source": "local", "revision": None, "process": process["name"],
+                                      "file": "sha256:" + info["sha256"], "sha256": info["sha256"],
+                                      "row": int(index) - info["offset"]}
+                        if origin is not None:
+                            event.metadata["origin"] = origin
+                            event.metadata["event_id"] = event_id(origin)
+                            if "event_ids" in info and event.metadata["event_id"] != info["event_ids"][int(index) - info["offset"]]:
+                                raise ValueError(f"Event identity differs from partition binding: {info['path']}")
                         if audit:
                             event.metadata["raw_stats"] = _raw_stats(row)
                         yield event
@@ -308,12 +591,21 @@ def _iter_process(process, tasks, split, reader, read_batch_size, *, audit=False
 class StreamingDataset(IterableDataset):
     """Worker-sharded row groups, proportionally mixed classes and bounded shuffle."""
 
-    def __init__(self, manifest, split, *, read_batch_size=128, shuffle_buffer=512, **reader_overrides):
+    def __init__(self, manifest, split, *, read_batch_size=128, shuffle_buffer=512,
+                 purpose="downstream", **reader_overrides):
         super().__init__()
-        if manifest.get("version") != 1 or manifest.get("algorithm") != "uniform-cap-feistel6-split-v1":
+        if (manifest.get("version"), manifest.get("algorithm")) not in {
+            (1, "uniform-cap-feistel6-split-v1"), (2, "partition-binding-v1")
+        }:
             raise ValueError("Unsupported dataset manifest version/algorithm.")
         if split not in {"train", "validation", "test"}:
             raise ValueError("split must be train, validation or test.")
+        if purpose not in {"downstream", "pretraining", "checkpoint_selection"}:
+            raise ValueError("purpose must be downstream, pretraining or checkpoint_selection.")
+        if purpose == "pretraining" and (split != "train" or manifest["version"] != 2):
+            raise ValueError("Pretraining requires shared partitions (dataset manifest v2) and the train split only.")
+        if purpose == "checkpoint_selection" and split != "validation":
+            raise ValueError("Checkpoint selection requires the validation split only.")
         if any(type(value) is not int or value < 1 for value in (read_batch_size, shuffle_buffer)):
             raise ValueError("read_batch_size and shuffle_buffer must be positive integers.")
         if any(value != manifest["reader"].get(key) for key, value in reader_overrides.items()):
@@ -410,4 +702,6 @@ def inspect_dataset(manifest, *, audit_events_per_class=32, read_batch_size=128,
     return result
 
 
-__all__ = ["build_manifest", "inspect_dataset", "StreamingDataset"]
+__all__ = ["build_manifest", "inspect_dataset", "StreamingDataset", "create_partition_manifest",
+           "bind_partition_manifest", "save_partition_manifest", "load_partition_manifest",
+           "validate_partition_manifest"]

@@ -18,6 +18,7 @@ import pyarrow.parquet as pq
 import torch
 
 from flowyforge.core.typing import EventBatch, ObjectGroup
+from flowyforge.data_plugins.collide_v2.provenance import event_id, pop_origin, provenance_columns
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,17 +317,21 @@ def iter_parquet_events(
             available = set(parquet.schema_arrow.names)
             if missing := sorted(required - available):
                 raise ValueError(f"{path}: missing required nested COLLIDE columns {missing}; scalar summaries are unsupported.")
-            selected = [column for column in columns if column in available]
+            selected = [column for column in columns if column in available] + provenance_columns(parquet.schema_arrow)
             batch_size = min(read_batch_size, max_events - seen) if max_events is not None else read_batch_size
             row_index = 0
             for record_batch in parquet.iter_batches(batch_size=batch_size, columns=selected):
                 for row in record_batch.to_pylist():
                     try:
+                        origin = pop_origin(row)
                         event = row_to_event_batch(row, view, specs, target=target,
                                                    eta_clip=eta_clip, value_clip=value_clip)
                     except ValueError as exc:
                         raise ValueError(f"{path}, row {row_index}: {exc}") from exc
                     event.metadata.update({"source_file": str(path), "source_row": row_index})
+                    if origin is not None:
+                        event.metadata["origin"] = origin
+                        event.metadata["event_id"] = event_id(origin)
                     yield event
                     seen += 1
                     row_index += 1

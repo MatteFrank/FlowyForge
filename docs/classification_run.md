@@ -143,7 +143,32 @@ vuote; lunghezze incoerenti tra campi o strutture annidate ambigue causano error
 con file e riga. Gli oggetti sono ordinati per PT e troncati secondo il contratto
 esistente; MET conserva l'ordine originale.
 
-## 3. Pilot rappresentativo
+## Partizioni portabili opzionali
+
+Per condividere le stesse appartenenze fra viste e fasi usare
+`--stage partitions --partition-manifest PATH`, quindi passare quel file a
+`inspect` e `train`. La [procedura completa nel README](../README.md#partizioni-condivise-fra-fullreco-l1t-e-fasi-di-apprendimento)
+descrive creazione, opzioni, identità, API per pretraining e rilocazione.
+Gli esempi seguenti senza tale opzione mantengono il comportamento legacy.
+
+Il manifest separato registra appartenenze esplicite per identità originale,
+seed, algoritmo, conteggi e checksum. La creazione non dipende dalla vista o dal
+reader. I run che lo usano salvano un binding `dataset_manifest.json` versione 2
+e una copia `partitions.json`; il checkpoint controlla entrambi attraverso i
+digest. `evaluate` può ricevere `--data-root NUOVA_RADICE`, verificando lo stesso
+insieme completo di eventi, anche dopo re-export con provenienza conservata.
+Le appartenenze non vengono ricampionate. Sono verificati SHA256 dei file e,
+per file riscritti, fingerprint dei contenuti/schema/metadati delle righe.
+
+Questa modalità richiede lettura raw iniziale e indici O(numero di eventi),
+anche con cap: i limiti di memoria del manifest implicito descritti sotto
+si riferiscono ai run senza partizioni portabili. La lettura degli oggetti
+trasformati rimane in streaming. Il pretraining può accedere esclusivamente
+a train con `StreamingDataset(..., purpose="pretraining")`; validation serve
+alla selezione del checkpoint, test al downstream finale. Nessun trainer di
+pretraining o loss fra viste viene aggiunto da questa API.
+
+## 3. Pilot rappresentativo dei file forniti
 
 ```bash
 python scripts/run_classification.py \
@@ -185,7 +210,7 @@ python scripts/run_classification.py \
 
 `0` sulla CLI oppure `null` nello YAML include tutti gli eventi delle classi
 selezionate. Gli split usano una permutazione deterministica non lineare degli
-indici per processo, con conteggi esatti: nel full run non viene conservato un
+indici per processo, con conteggi esatti: nel full run legacy non viene conservato un
 array di indici lungo quanto il dataset. Il manifest congela l'ordine dei file,
 il seed, l'algoritmo e i conteggi necessari alla riproduzione.
 
@@ -229,8 +254,10 @@ python scripts/run_classification.py \
 
 Vengono ricalcolate validation e test sul manifest originale, senza nuovi split.
 Conservare insieme checkpoint, manifest, preflight e history e mantenere accessibili
-gli stessi file sorgente. Il digest del manifest e dimensione/mtime dei file letti
-vengono controllati: non sono un hash completo dei contenuti dei Parquet.
+gli stessi file sorgente. Nel percorso legacy il digest del manifest e
+dimensione/mtime dei file letti vengono controllati: non sono un hash completo
+dei contenuti dei Parquet. Il percorso con partizioni condivise verifica anche
+SHA256 e permette la rilocazione esplicita descritta sopra.
 Senza `--output-dir`, l'output è `CHECKPOINT_DIR/evaluation`. La diagnostica di
 questa fase copre solo validation/test. `--batch-size` e `--num-workers` possono
 essere cambiati senza cambiare la selezione; possono variare l'ordine e piccoli
@@ -254,6 +281,7 @@ Questa fase legge solo `metrics.json`, senza training né lettura dei Parquet.
 | --- | --- |
 | `resolved_config.yaml` | Configurazione effettiva del run |
 | `dataset_manifest.json` | Classi, file, schema, unità dichiarate, campionamento e split |
+| `partitions.json` (opzionale) | Appartenenze stabili condivise; copia del manifest scelto tramite `--partition-manifest` |
 | `preflight.json` | Audit limitato dei valori e riepilogo dei controlli |
 | `checkpoint.pt` | Parametri del modello selezionato, configurazione e digest del manifest |
 | `history.json` | Training e validazione per epoca, scritto progressivamente |
@@ -272,8 +300,8 @@ Le etichette sono quelle delle directory/mapping, non inferenze dalla fisica deg
 eventi. Gli split sono separati per riga sorgente; **non** si deduplicano eventi
 fisici replicati in file diversi. Prima di risultati scientifici definitivi,
 verificare identità degli eventi, eventuali correlazioni tra campagne e pesi fisici.
-Il manifest salva percorsi assoluti e fingerprint dei file: spostare i dati su
-un altro sistema richiede una gestione esplicita, non implementata dal runner.
+Il manifest legacy salva percorsi assoluti e fingerprint dei file. Per spostare
+i dati usare un run con partizioni condivise e `--data-root` in valutazione.
 La riproducibilità riguarda input/configurazione invariati; non garantisce identità
 bit a bit tra device e versioni PyTorch. Un nuovo cap o inventario produce un nuovo
 manifest. Il runner usa un singolo device, senza DDP né resume.

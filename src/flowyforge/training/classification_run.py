@@ -28,7 +28,7 @@ from flowyforge.data_plugins.collide_v2.object_dataset import (
     collate_event_batches, collection_feature_dims, default_collection_specs,
 )
 from flowyforge.data_plugins.collide_v2.streaming import (
-    StreamingDataset, build_manifest, inspect_dataset,
+    StreamingDataset, bind_partition_manifest, build_manifest, inspect_dataset, load_partition_manifest,
 )
 from flowyforge.model_plugins import EventClassificationModel, FoundationEncoder, PerceiverConfig
 
@@ -48,10 +48,10 @@ def load_run_config(path: str | Path, overrides: Mapping[str, Any] | None = None
     path = Path(path).expanduser().resolve()
     raw = load_yaml(path)
     overrides = dict(overrides or {})
-    _known(raw, {"mode", "model_config", "output_dir", "seed", "sources", "data", "training"}, "run")
+    _known(raw, {"mode", "model_config", "output_dir", "seed", "sources", "data", "training", "partition_manifest"}, "run")
     _known(overrides, {"mode", "processes", "data_root", "process_names", "max_events_per_class",
                        "view", "device", "epochs", "batch_size", "num_workers", "seed",
-                       "output_dir", "model_config"}, "override")
+                       "output_dir", "model_config", "partition_manifest"}, "override")
     mode = overrides.get("mode", raw.get("mode", "small"))
     if mode not in {"small", "eos"}:
         raise ValueError("mode must be small or eos.")
@@ -124,7 +124,13 @@ def load_run_config(path: str | Path, overrides: Mapping[str, Any] | None = None
             raise ValueError(f"Invalid {key}: {value}")
     seed = overrides.get("seed", raw.get("seed", 42))
     _positive_integer(seed, "seed", 0)
+    partition_path = overrides.get("partition_manifest", raw.get("partition_manifest"))
+    if partition_path is not None:
+        if not isinstance(partition_path, (str, Path)) or not str(partition_path).strip():
+            raise ValueError("partition_manifest must be a nonempty path or null.")
+        partition_path = str(Path(partition_path).expanduser())
     return {"mode": mode, "source": source, "model": model, "data": data, "training": training,
+            "partition_manifest": partition_path,
             "seed": seed, "output_dir": str(Path(overrides.get("output_dir", raw.get("output_dir", "outputs/classification"))).expanduser()),
             "config_path": str(path), "model_config_path": str(model_path.resolve())}
 
@@ -279,6 +285,7 @@ def _base_metrics(config: dict[str, Any], manifest: dict[str, Any], preflight: d
         "config": config, "mode": config["mode"], "view": config["data"]["view"],
         "device": str(device), "seed": config["seed"], "label_map": manifest["label_map"],
         "checkpoint_selection": "minimum validation loss", "dataset_manifest_sha256": _manifest_digest(manifest),
+        "partition_sha256": manifest.get("partition_sha256"),
         "expected_split_class_counts": {
             split: {process["name"]: process["split_counts"][split] for process in manifest["processes"]}
             for split in ("train", "validation", "test")
@@ -328,10 +335,18 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
     output.mkdir(parents=True, exist_ok=True)
     (output / "resolved_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     print("Building dataset manifest and checking Parquet schemas...", flush=True)
-    manifest = build_manifest(config["source"], seed=config["seed"],
-                              validation_fraction=config["data"]["validation_fraction"],
-                              test_fraction=config["data"]["test_fraction"],
-                              **{key: value for key, value in _reader_settings(config).items() if key != "read_batch_size"})
+    reader = {key: value for key, value in _reader_settings(config).items() if key != "read_batch_size"}
+    if config.get("partition_manifest"):
+        partitions = load_partition_manifest(config["partition_manifest"])
+        for key in ("validation_fraction", "test_fraction"):
+            if config["data"][key] != partitions[key]:
+                raise ValueError(f"{key} differs from the saved partition manifest.")
+        manifest = bind_partition_manifest(partitions, config["source"], **reader)
+        _write_json(output / "partitions.json", partitions)
+    else:
+        manifest = build_manifest(config["source"], seed=config["seed"],
+                                  validation_fraction=config["data"]["validation_fraction"],
+                                  test_fraction=config["data"]["test_fraction"], **reader)
     preflight = inspect_dataset(manifest, audit_events_per_class=config["data"]["audit_events_per_class"],
                                 **_reader_settings(config))
     _write_json(output / "dataset_manifest.json", manifest)
@@ -398,7 +413,7 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
 
 def evaluate_run(checkpoint_path: str | Path, *, output_dir: str | Path,
                   device: str | None = None, batch_size: int | None = None,
-                  num_workers: int | None = None) -> dict[str, Any]:
+                  num_workers: int | None = None, data_root: str | Path | None = None) -> dict[str, Any]:
     """Evaluate the checkpoint on its frozen validation/test rows, never resplit."""
     checkpoint_path = Path(checkpoint_path).expanduser()
     output = Path(output_dir).expanduser()
@@ -412,6 +427,17 @@ def evaluate_run(checkpoint_path: str | Path, *, output_dir: str | Path,
         raise ValueError("Dataset manifest differs from the manifest saved with the checkpoint.")
     config = checkpoint["config"]
     config["output_dir"] = str(output_dir)
+    if manifest.get("version") == 2:
+        partitions = load_partition_manifest(checkpoint_path.parent / "partitions.json")
+        if partitions["sha256"] != manifest["partition_sha256"]:
+            raise ValueError("Partition manifest differs from the checkpoint's saved memberships.")
+        source = config["source"] if data_root is None else {
+            "root": str(data_root), "process_names": list(manifest["label_map"]), "max_events_per_class": None}
+        config["source"] = source
+        manifest = bind_partition_manifest(partitions, source, **{
+            key: value for key, value in _reader_settings(config).items() if key != "read_batch_size"})
+    elif data_root is not None:
+        raise ValueError("Relocation requires a run with shared partitions (dataset manifest v2); legacy v1 paths are frozen.")
     for key, value in (("device", device), ("batch_size", batch_size), ("num_workers", num_workers)):
         if value is not None:
             config["training"][key] = value
@@ -433,6 +459,9 @@ def evaluate_run(checkpoint_path: str | Path, *, output_dir: str | Path,
     _record_split_counts(metrics)
     _finish_diagnostics(metrics["diagnostics"])
     output.mkdir(parents=True, exist_ok=True)
+    if manifest.get("version") == 2:
+        _write_json(output / "dataset_manifest.json", manifest)
+        _write_json(output / "partitions.json", partitions)
     _write_json(output / "metrics.json", metrics)
     write_classification_report(metrics, output)
     return metrics

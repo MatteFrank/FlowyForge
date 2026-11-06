@@ -1,6 +1,9 @@
 """One tiny CPU integration run; no external datasets or downloads."""
 
 import json
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pyarrow as pa
@@ -45,12 +48,15 @@ def test_invalid_run_config_fails_before_reading_data():
         load_run_config(path, {"mode": "eos", "max_events_per_class": 2})
     with pytest.raises(ValueError, match="batch_size"):
         load_run_config(path, {"mode": "eos", "batch_size": 0})
+    with pytest.raises(ValueError, match="partition_manifest"):
+        load_run_config(path, {"mode": "eos", "partition_manifest": False})
     config = load_run_config(path, {"mode": "eos", "max_events_per_class": 0})
     assert config["source"]["max_events_per_class"] is None
     assert config["source"]["root"] == "/eos/project/f/foundational-model-dataset/samples/"
 
 
-def test_small_train_reload_report_and_manifest_integrity(tmp_path):
+@pytest.mark.parametrize("shared", [False, True])
+def test_small_train_reload_report_and_manifest_integrity(tmp_path, shared):
     processes = {}
     for label, name in enumerate(("a", "b")):
         rows = [{"FullReco_PUPPIMET_MET": [float(i + label * 20)],
@@ -73,6 +79,19 @@ def test_small_train_reload_report_and_manifest_integrity(tmp_path):
     config["training"]["cpu_threads"] = 1
     config["data"]["audit_events_per_class"] = 3
     config["data"]["shuffle_buffer"] = 4
+    if shared:
+        partition_path = tmp_path / "partitions.json"
+        command = [sys.executable, str(REPO / "scripts/run_classification.py"),
+                   "--stage", "partitions", "--model-config", str(model_config),
+                   "--partition-manifest", str(partition_path), "--max-events-per-class", "20"]
+        for name, path in processes.items():
+            command.extend(["--process", f"{name}={path}"])
+        result = subprocess.run(command, cwd=REPO, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        repeated = subprocess.run(command, cwd=REPO, capture_output=True, text=True)
+        assert repeated.returncode == 1
+        assert "overwrite existing partitions" in repeated.stderr
+        config["partition_manifest"] = str(partition_path)
     previous_threads = torch.get_num_threads()
     try:
         preflight = run_classification(config, inspect_only=True)
@@ -88,11 +107,32 @@ def test_small_train_reload_report_and_manifest_integrity(tmp_path):
         assert list((output / "tables").glob("*.csv"))
         assert list((output / "plots").glob("*.png"))
         assert list((output / "plots").glob("*.pdf"))
-        loaded = evaluate_run(output / "checkpoint.pt", output_dir=tmp_path / "evaluation", device="cpu")
+        relocation = {}
+        if shared:
+            moved = tmp_path / "relocated"
+            for name, path in processes.items():
+                (moved / name).mkdir(parents=True)
+                shutil.move(path, moved / name / "copied.parquet")
+            relocation["data_root"] = moved
+            partition_path.unlink()  # Evaluation must use the immutable run snapshot.
+            assert metrics["partition_sha256"]
+        loaded = evaluate_run(output / "checkpoint.pt", output_dir=tmp_path / "evaluation", device="cpu", **relocation)
         assert loaded["test"]["confusion_matrix"] == metrics["test"]["confusion_matrix"]
         assert loaded["test"]["loss"] == pytest.approx(metrics["test"]["loss"])
         with pytest.raises(FileExistsError, match="existing"):
             run_classification(config)
+        if shared:
+            from flowyforge.data_plugins.collide_v2.streaming import _json_digest
+            saved = output / "partitions.json"
+            changed = json.loads(saved.read_text())
+            changed["seed"] += 1
+            changed["sha256"] = _json_digest({k: v for k, v in changed.items() if k != "sha256"})
+            saved.write_text(json.dumps(changed))
+            with pytest.raises(ValueError, match="saved memberships"):
+                evaluate_run(output / "checkpoint.pt", output_dir=tmp_path / "bad_partitions", **relocation)
+        else:
+            with pytest.raises(ValueError, match="Relocation requires"):
+                evaluate_run(output / "checkpoint.pt", output_dir=tmp_path / "bad_relocation", data_root=tmp_path)
         manifest_path = output / "dataset_manifest.json"
         manifest = json.loads(manifest_path.read_text())
         manifest["tampered"] = True

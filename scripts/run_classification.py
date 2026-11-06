@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Inspect, train, evaluate or report a small/EOS structured COLLIDE classifier."""
+"""Create shared partitions, inspect, train, evaluate or report COLLIDE events."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from pathlib import Path
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/runs/classification.yaml")
-    parser.add_argument("--stage", choices=("inspect", "train", "evaluate", "report"), default="train")
+    parser.add_argument("--stage", choices=("partitions", "inspect", "train", "evaluate", "report"), default="train")
+    parser.add_argument("--partition-manifest", help="Create at --stage partitions; reuse for inspect/train. Path relative to cwd.")
     parser.add_argument("--mode", choices=("small", "eos"))
     parser.add_argument("--process", action="append", metavar="NAME=PATH_OR_GLOB",
                         help="Repeat for each class. Overrides the selected YAML process map; quote globs.")
@@ -36,8 +37,10 @@ def main() -> int:
 
     try:
         if args.stage in {"evaluate", "report"}:
-            invalid = [name for name in ("mode", "process", "data_root", "process_name", "max_events_per_class",
-                                         "view", "model_config", "epochs", "seed") if getattr(args, name) is not None]
+            invalid = [name for name in ("mode", "process", "process_name", "max_events_per_class",
+                                         "view", "model_config", "epochs", "seed", "partition_manifest") if getattr(args, name) is not None]
+            if args.stage == "report" and args.data_root is not None:
+                invalid.append("data_root")
             if invalid:
                 raise ValueError(f"{args.stage} uses the saved run; remove input/training overrides: {invalid}")
             if args.stage == "report":
@@ -56,7 +59,7 @@ def main() -> int:
             from flowyforge.training.classification_run import evaluate_run
 
             metrics = evaluate_run(checkpoint, output_dir=output, device=args.device,
-                                   batch_size=args.batch_size, num_workers=args.num_workers)
+                                   batch_size=args.batch_size, num_workers=args.num_workers, data_root=args.data_root)
         else:
             from flowyforge.training.classification_run import load_run_config, run_classification
 
@@ -76,6 +79,20 @@ def main() -> int:
                     processes[name] = value
                 overrides["processes"] = processes
             config = load_run_config(args.config, overrides)
+            if args.stage == "partitions":
+                from flowyforge.data_plugins.collide_v2.streaming import create_partition_manifest, save_partition_manifest
+
+                if not config.get("partition_manifest"):
+                    raise ValueError("partitions requires --partition-manifest PATH or partition_manifest in YAML.")
+                target = Path(config["partition_manifest"]).expanduser()
+                if target.exists():
+                    raise FileExistsError(f"Refusing to overwrite existing partitions: {target}. Reuse them or choose a new path.")
+                partitions = create_partition_manifest(config["source"], seed=config["seed"],
+                    validation_fraction=config["data"]["validation_fraction"],
+                    test_fraction=config["data"]["test_fraction"], read_batch_size=min(4, config["data"]["read_batch_size"]))
+                save_partition_manifest(partitions, target)
+                print(f"Partitions: {target}; counts: {partitions['split_counts']}; SHA256: {partitions['sha256']}")
+                return 0
             metrics = run_classification(config, inspect_only=args.stage == "inspect")
             output = Path(config["output_dir"])
         if args.stage == "inspect":

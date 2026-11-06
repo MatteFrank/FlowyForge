@@ -2,6 +2,8 @@
 
 import math
 import os
+import copy
+import shutil
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from flowyforge.data_plugins.collide_v2 import streaming
 from flowyforge.data_plugins.collide_v2.streaming import StreamingDataset, build_manifest, inspect_dataset
+from flowyforge.data_plugins.collide_v2.provenance import with_origin, sha256_file
 from flowyforge.data_plugins.collide_v2.object_dataset import collate_event_batches
 from flowyforge.training.classification_run import _init_worker
 
@@ -26,7 +29,8 @@ def make_sources(tmp_path, rows=30):
         directory.mkdir()
         for part in range(3):
             data = [{"FullReco_PUPPIMET_MET": [float(i + part * rows + 1)],
-                     "FullReco_PUPPIMET_Phi": [0.1]} for i in range(rows)]
+                     "FullReco_PUPPIMET_Phi": [0.1], "L1T_PUPPIMET_MET": [float(i + 2)],
+                     "L1T_PUPPIMET_Phi": [0.2]} for i in range(rows)]
             pq.write_table(pa.Table.from_pylist(data), directory / f"{part}.parquet", row_group_size=7)
     return {"root": str(tmp_path)}
 
@@ -147,3 +151,144 @@ def test_known_production_wrapper_and_ambiguous_layout(tmp_path):
     (tmp_path / "production_other").mkdir()
     with pytest.raises(ValueError, match="Ambiguous"):
         build_manifest({"root": str(tmp_path)}, collection_limits=LIMITS)
+
+
+def partition_ids(binding, split, **kwargs):
+    return {event.metadata["event_id"] for event in StreamingDataset(binding, split, **kwargs)}
+
+
+@pytest.mark.parametrize("cap", [None, 11])
+def test_portable_partitions_reproducible_disjoint_shared_views_and_no_resampling(tmp_path, monkeypatch, cap):
+    source = {**make_sources(tmp_path, rows=5), "max_events_per_class": cap}
+    manifest = streaming.create_partition_manifest(source, seed=11)
+    assert manifest == streaming.create_partition_manifest(source, seed=11, read_batch_size=3)
+    other = streaming.create_partition_manifest(source, seed=12)
+    memberships = lambda m: {e["id"]: e["split"] for p in m["processes"] for e in p["events"]}
+    assert memberships(manifest) != memberships(other)
+    assert all(p["split_counts"] == ({"train": 9, "validation": 3, "test": 3} if cap is None else
+                                      {"train": 7, "validation": 2, "test": 2}) for p in manifest["processes"])
+    target = tmp_path / "partitions.json"
+    streaming.save_partition_manifest(manifest, target)
+    saved = target.read_bytes()
+    with pytest.raises(FileExistsError):
+        streaming.save_partition_manifest(other, target)
+    assert target.read_bytes() == saved
+    assert str(tmp_path) not in target.read_text()
+    manifest = streaming.load_partition_manifest(target)
+    # Reuse must never call the cap sampler or the split permutation.
+    def no_sampling(*args, **kwargs):
+        raise AssertionError("Stored partitions must not be resampled")
+    monkeypatch.setattr(streaming.random.Random, "sample", no_sampling)
+    monkeypatch.setattr(streaming, "_permuted_ranks", no_sampling)
+    full = streaming.bind_partition_manifest(manifest, source, collection_limits=LIMITS)
+    l1t = streaming.bind_partition_manifest(manifest, source, collection_limits=LIMITS, view="L1T", eta_clip=4.)
+    sets = {split: partition_ids(full, split) for split in streaming.SPLITS}
+    assert sets == {split: partition_ids(l1t, split) for split in streaming.SPLITS}
+    assert not sets["train"] & sets["validation"]
+    assert not sets["train"] & sets["test"]
+    assert not sets["test"] & sets["validation"]
+    assert sum(map(len, sets.values())) == 2 * (cap or 15)
+    assert partition_ids(full, "train", purpose="pretraining") == sets["train"]
+    assert partition_ids(full, "validation", purpose="checkpoint_selection") == sets["validation"]
+    for split in ("validation", "test"):
+        with pytest.raises(ValueError, match="train split only"):
+            StreamingDataset(full, split, purpose="pretraining")
+    with pytest.raises(ValueError, match="validation split only"):
+        StreamingDataset(full, "test", purpose="checkpoint_selection")
+    worker_sets = []
+    for worker_id in range(3):
+        monkeypatch.setattr(streaming, "get_worker_info", lambda worker_id=worker_id: SimpleNamespace(id=worker_id, num_workers=3))
+        worker_sets.append(partition_ids(full, "train"))
+    assert set.union(*worker_sets) == sets["train"]
+    assert sum(map(len, worker_sets)) == len(sets["train"])
+
+
+def test_partition_identity_survives_relocation_reexport_and_row_reordering(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    source = make_sources(raw, rows=4)
+    partitions = streaming.create_partition_manifest(source)
+    initial = streaming.bind_partition_manifest(partitions, source, collection_limits=LIMITS)
+    expected = {split: partition_ids(initial, split) for split in streaming.SPLITS}
+    moved = tmp_path / "moved"
+    shutil.copytree(raw, moved)
+    relocated = streaming.bind_partition_manifest(partitions, {"root": moved}, collection_limits=LIMITS)
+    assert expected == {split: partition_ids(relocated, split) for split in streaming.SPLITS}
+    exported = tmp_path / "exported"
+    for name in ("a", "b"):
+        tables = []
+        for path in sorted((raw / name).glob("*.parquet")):
+            table = pq.read_table(path)
+            tables.append(with_origin(table, {"source": "local", "revision": None, "process": name,
+                "file": path.as_uri(), "sha256": sha256_file(path)}, list(range(len(table)))))
+        table = pa.concat_tables(tables)
+        table = table.take(pa.array(list(reversed(range(len(table))))))
+        (exported / name).mkdir(parents=True)
+        pq.write_table(table, exported / name / "reencoded.parquet", compression="gzip", row_group_size=2)
+    rebound = streaming.bind_partition_manifest(partitions, {"root": exported}, collection_limits=LIMITS)
+    assert expected == {split: partition_ids(rebound, split) for split in streaming.SPLITS}
+    for event in StreamingDataset(rebound, "train"):
+        assert event.metadata["origin"]["file"].startswith("file:")
+    # A retained identity with changed features must fail too.
+    path = exported / "a/reencoded.parquet"
+    table = pq.read_table(path)
+    table = table.set_column(table.schema.get_field_index("L1T_PUPPIMET_MET"), "L1T_PUPPIMET_MET",
+                             pa.array([[999.0]] * len(table)))
+    pq.write_table(table, path)
+    with pytest.raises(ValueError, match="content/schema changed"):
+        streaming.bind_partition_manifest(partitions, {"root": exported}, collection_limits=LIMITS)
+
+
+def test_partitions_reject_incompatible_manifests_caps_sources_and_duplicates(tmp_path):
+    source = make_sources(tmp_path, rows=3)
+    partitions = streaming.create_partition_manifest(source)
+    bad = copy.deepcopy(partitions)
+    bad["version"] = 99
+    with pytest.raises(ValueError, match="version"):
+        streaming.bind_partition_manifest(bad, source, collection_limits=LIMITS)
+    bad = copy.deepcopy(partitions)
+    bad["processes"][0]["events"][0]["split"] = "test"
+    bad["seed"] += 1
+    with pytest.raises(ValueError, match="checksum"):
+        streaming.validate_partition_manifest(bad)
+    bad["sha256"] = streaming._json_digest({k: v for k, v in bad.items() if k != "sha256"})
+    bad["processes"][0]["events"][0]["id"] = "invalid"
+    bad["sha256"] = streaming._json_digest({k: v for k, v in bad.items() if k != "sha256"})
+    with pytest.raises(ValueError, match="identity"):
+        streaming.validate_partition_manifest(bad)
+    with pytest.raises(ValueError, match="cap differs"):
+        streaming.bind_partition_manifest(partitions, {**source, "max_events_per_class": 4}, collection_limits=LIMITS)
+    path = tmp_path / "a/0.parquet"
+    duplicate = tmp_path / "a/duplicate.parquet"
+    shutil.copyfile(path, duplicate)
+    with pytest.raises(ValueError, match="Duplicate event identity"):
+        streaming.bind_partition_manifest(partitions, source, collection_limits=LIMITS)
+    duplicate.unlink()
+    path.unlink()
+    with pytest.raises(ValueError, match="identities changed"):
+        streaming.bind_partition_manifest(partitions, source, collection_limits=LIMITS)
+
+
+def test_partition_source_hash_checked_even_when_stat_is_unchanged(tmp_path):
+    source = make_sources(tmp_path, rows=3)
+    partitions = streaming.create_partition_manifest(source)
+    binding = streaming.bind_partition_manifest(partitions, source, collection_limits=LIMITS)
+    path = tmp_path / "a/0.parquet"
+    stat = path.stat()
+    content = bytearray(path.read_bytes())
+    content[10] ^= 1
+    path.write_bytes(content)
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    with pytest.raises(ValueError, match="content changed"):
+        list(StreamingDataset(binding, "train"))
+
+
+def test_partition_too_small_and_legacy_pretraining_are_rejected(tmp_path):
+    source = make_sources(tmp_path, rows=1)
+    legacy = build_manifest(source, collection_limits=LIMITS)
+    with pytest.raises(ValueError, match="shared partitions"):
+        StreamingDataset(legacy, "train", purpose="pretraining")
+    for name in ("a", "b"):
+        (tmp_path / name / "2.parquet").unlink()
+    with pytest.raises(ValueError, match="at least 3"):
+        streaming.create_partition_manifest(source)

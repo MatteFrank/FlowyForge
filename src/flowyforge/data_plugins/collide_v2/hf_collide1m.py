@@ -6,11 +6,13 @@ import json
 import math
 import re
 from itertools import islice
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+from flowyforge.data_plugins.collide_v2.provenance import sha256_file
 
 MAX_ROWS_RAW_MODE = 100
 
@@ -165,4 +167,89 @@ def prepare_hf_source(config: Mapping[str, Any]) -> dict[str, Any]:
     return manifest
 
 
-__all__ = ["materialize_hf_collide1m_subset", "materialize_hf_collide1m_multi_process_subset", "prepare_hf_source"]
+def plan_hf_files(dataset: str, revision: str, processes: Mapping[str, list[str]],
+                  max_download_bytes: int, *, api=None) -> dict[str, Any]:
+    """Verify explicit files at a pinned commit; inspect metadata, download no data.
+
+    The cap is the total compressed size of the selected files, including cached
+    ones. It is not a bound on retries, HTTP overhead or exported/decompressed data.
+    """
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("HF revision must be a pinned full 40-character commit SHA, not main/tag.")
+    if type(max_download_bytes) is not int or max_download_bytes < 1:
+        raise ValueError("max_download_bytes must be a positive integer.")
+    if not processes or any(not isinstance(name, str) or not name for name in processes):
+        raise ValueError("Provide named HF processes and explicit files.")
+    selected = []
+    for process, filenames in processes.items():
+        if not isinstance(filenames, list) or not filenames:
+            raise ValueError(f"{process}: provide an explicit nonempty list of HF files.")
+        for name in filenames:
+            if (not isinstance(name, str) or PurePosixPath(name).is_absolute()
+                    or any(part in {"", ".", ".."} for part in name.split("/"))
+                    or any(char in name for char in "*?[]\\:") or not name.endswith(".parquet")
+                    or name.split("/", 1)[0] != process):
+                raise ValueError(f"Invalid explicit HF file for process {process}: {name!r}")
+            selected.append((process, name))
+    if len({name for _, name in selected}) != len(selected):
+        raise ValueError("Duplicate HF files are not allowed.")
+    if api is None:
+        from huggingface_hub import HfApi
+        api = HfApi()
+    info = api.dataset_info(dataset, revision=revision, files_metadata=True)
+    if info.sha != revision:
+        raise ValueError("HF resolved revision differs from the pinned commit.")
+    available = {entry.rfilename: entry for entry in info.siblings}
+    files = []
+    for process, name in selected:
+        if name not in available:
+            raise ValueError(f"HF file not found at {revision}: {name}")
+        entry = available[name]
+        if type(entry.size) is not int or entry.size <= 0:
+            raise ValueError(f"Missing trustworthy remote size for {name}; refusing download.")
+        lfs = entry.lfs
+        digest = lfs.get("sha256") if isinstance(lfs, dict) else getattr(lfs, "sha256", None)
+        files.append({"process": process, "logical_file": name, "size_bytes": entry.size,
+                      "remote_sha256": digest})
+    total = sum(entry["size_bytes"] for entry in files)
+    if total > max_download_bytes:
+        raise ValueError(f"Selected HF files require {total} bytes, exceeding max_download_bytes={max_download_bytes}. No download started.")
+    return {"kind": "hf_files", "dataset": dataset, "revision": revision,
+            "files": files, "selected_bytes": total, "max_download_bytes": max_download_bytes,
+            "sampling_scope": "explicitly selected files, not a uniform sample of the remote dataset"}
+
+
+def download_hf_files(plan: Mapping[str, Any], download_dir: str | Path, *, downloader=None) -> list[dict]:
+    """Retain only planned files locally; verify sizes/hashes and protect originals."""
+    if sum(entry["size_bytes"] for entry in plan["files"]) > plan["max_download_bytes"]:
+        raise ValueError("HF download plan exceeds its byte limit.")
+    if downloader is None:
+        from huggingface_hub import hf_hub_download
+        downloader = hf_hub_download
+    root = Path(download_dir).expanduser().resolve() / plan["revision"]
+    results = []
+    for entry in plan["files"]:
+        path = root / entry["logical_file"]
+        if not path.resolve().is_relative_to(root):
+            raise ValueError(f"HF destination escapes download directory: {path}")
+        expected_hash = entry.get("remote_sha256")
+        if path.exists():
+            if (not path.is_file() or path.stat().st_size != entry["size_bytes"]
+                    or not expected_hash or sha256_file(path) != expected_hash):
+                raise FileExistsError(f"Refusing to overwrite unverifiable/different cached original: {path}")
+            print(f"Reusing verified original: {entry['logical_file']}", flush=True)
+        else:
+            print(f"Downloading {entry['logical_file']} ({entry['size_bytes']:,} bytes)", flush=True)
+            downloaded = Path(downloader(repo_id=plan["dataset"], filename=entry["logical_file"],
+                                        repo_type="dataset", revision=plan["revision"], local_dir=str(root)))
+            if downloaded.resolve() != path.resolve():
+                raise ValueError("Downloader returned an unexpected path.")
+        digest = sha256_file(path)
+        if path.stat().st_size != entry["size_bytes"] or (expected_hash and digest != expected_hash):
+            raise ValueError(f"Downloaded file failed size/SHA256 verification: {path}")
+        results.append({**entry, "path": str(path), "sha256": digest})
+    return results
+
+
+__all__ = ["materialize_hf_collide1m_subset", "materialize_hf_collide1m_multi_process_subset",
+           "prepare_hf_source", "plan_hf_files", "download_hf_files"]

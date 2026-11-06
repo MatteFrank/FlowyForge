@@ -1,4 +1,5 @@
 data/
+!configs/data/
 outputs/
 *.npy
 *.parquet

@@ -1,13 +1,14 @@
 from pathlib import Path
 
-import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 from flowyforge.data_plugins.collide_v2.source_resolver import resolve_dataset_source
 
 
 def _write_parquet(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({"event_id": [1, 2], "pt": [10.0, 20.0]}).to_parquet(path, index=False)
+    pq.write_table(pa.table({"event_id": [1, 2], "pt": [10.0, 20.0]}), path)
 
 
 def test_source_resolver_local_fake_dataset(tmp_path: Path) -> None:

@@ -7,10 +7,8 @@
 # Versions are intentionally not locked to one OS, Python version or accelerator.
 pyyaml
 numpy
-pandas
 pyarrow
 matplotlib
-scikit-learn
 pytest
 
 # Install a site-approved CPU/CUDA build first if the cluster requires one.

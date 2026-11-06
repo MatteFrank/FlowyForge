@@ -1,25 +1,7 @@
+# Optional schema inspection; training uses configs/runs/classification.yaml.
 paths:
   dataset_backend: eos
-  dataset_dir: /eos/project/f/foundational-model-dataset/samples/production_final
-  tmp_data_dir: /tmp/flowyforge/collide2v
-  processed_data_dir: /eos/user/${USER}/flowyforge/collide2v_processed
+  dataset_dir: /eos/project/f/foundational-model-dataset/samples/
 
 data:
-  max_files: 4
-  max_rows: null
-  feature_columns: null
-  label_column: process_id
-  exclude_columns:
-    - event_id
-    - process_name
-    - view
-  output_subdir: vectorized
-  processes: null
-  materialize_local_parquet: false
-
-preprocessing:
-  method: standardize
-  eps: 1.0e-6
-  input_subdir: vectorized
-  output_subdir: preprocessed
-  copy_labels: true
+  max_files: 2

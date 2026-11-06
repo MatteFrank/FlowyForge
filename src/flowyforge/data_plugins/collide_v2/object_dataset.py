@@ -163,7 +163,7 @@ def row_to_event_batch(
         raise ValueError("eta_clip and value_clip must be finite and positive.")
     missing = sorted(set(required_columns(view, specs)) - row.keys())
     if missing:
-        raise ValueError(f"Missing required nested COLLIDE columns: {missing}. Scalar-summary B1 data is unsupported.")
+        raise ValueError(f"Missing required nested COLLIDE columns: {missing}. Scalar-summary data is unsupported.")
     groups: dict[str, ObjectGroup] = {}
     for spec in specs:
         columns = {field: f"{view}_{spec.name}_{field}" for field in spec.fields}
@@ -315,7 +315,7 @@ def iter_parquet_events(
         with pq.ParquetFile(path) as parquet:
             available = set(parquet.schema_arrow.names)
             if missing := sorted(required - available):
-                raise ValueError(f"{path}: missing required nested COLLIDE columns {missing}; B1 scalar summaries are unsupported.")
+                raise ValueError(f"{path}: missing required nested COLLIDE columns {missing}; scalar summaries are unsupported.")
             selected = [column for column in columns if column in available]
             batch_size = min(read_batch_size, max_events - seen) if max_events is not None else read_batch_size
             row_index = 0

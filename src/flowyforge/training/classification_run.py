@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
+import os
 import random
 import time
 from dataclasses import asdict
@@ -238,13 +240,35 @@ def _reader_settings(config: dict[str, Any]) -> dict[str, Any]:
             ("view", "read_batch_size", "units", "collection_limits", "eta_clip", "value_clip")}
 
 
+def _init_worker(worker_id: int) -> None:
+    """Keep worker IPC descriptors out of exec'ed shared-memory helpers."""
+    if os.name == "posix":
+        # Spawn passes tracker and worker-sentinel pipes as inheritable FDs.
+        # torch_shm_manager must not keep these alive after the worker exits:
+        # that delays worker joins and can deadlock Python's finalization.
+        # CLOEXEC preserves the worker's open FDs, closing only copies in a
+        # subsequently exec'ed helper. Leave standard streams available.
+        try:
+            descriptors = [int(name) for name in os.listdir("/dev/fd")]
+        except FileNotFoundError:
+            descriptors = range(3, os.sysconf("SC_OPEN_MAX"))
+        for fd in descriptors:
+            if fd >= 3:
+                try:
+                    os.set_inheritable(fd, False)
+                except OSError as exc:
+                    if exc.errno != errno.EBADF:  # e.g. the closed /dev/fd iterator
+                        raise
+
+
 def _loader(manifest: dict[str, Any], config: dict[str, Any], split: str) -> DataLoader:
     dataset = StreamingDataset(manifest, split, shuffle_buffer=config["data"]["shuffle_buffer"],
                                **_reader_settings(config))
     workers = config["training"]["num_workers"]
     # Spawn avoids inheriting a CUDA context. Each epoch gets the updated epoch
     # seed; worker sharding belongs to the iterable dataset, not a sampler.
-    options = {"multiprocessing_context": "spawn", "prefetch_factor": 2} if workers else {}
+    options = {"multiprocessing_context": "spawn", "prefetch_factor": 2,
+               "worker_init_fn": _init_worker} if workers else {}
     return DataLoader(dataset, batch_size=config["training"]["batch_size"], num_workers=workers,
                       collate_fn=collate_event_batches, generator=torch.Generator().manual_seed(config["seed"]), **options)
 

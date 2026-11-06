@@ -26,7 +26,7 @@ from flowyforge.model_plugins import (
 )
 from flowyforge.model_plugins.base import ModelPlugin
 from flowyforge.representation.tokenizer import ObjectTokenizer, TokenBatch
-from flowyforge.training.foundation_smoke import stratified_event_split
+from flowyforge.data_plugins.collide_v2.streaming import StreamingDataset
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -298,22 +298,9 @@ def test_parquet_stream_paths_caps_provenance_and_labels(tmp_path, view):
         expand_parquet_paths(tmp_path / "missing*.parquet")
     bad = tmp_path / "bad.parquet"
     pq.write_table(pa.table({f"{view}_PUPPIPart_PT_mean": [3.0]}), bad)
-    with pytest.raises(ValueError, match="B1 scalar summaries"):
+    with pytest.raises(ValueError, match="scalar summaries"):
         list(iter_parquet_events(bad, view))
 
-
-def test_stratified_split_is_disjoint_reproducible_and_requires_three_per_class():
-    events = [row_to_event_batch(synthetic_row(), target=label) for label in (0, 1) for _ in range(10)]
-    splits = stratified_event_split(events, 17)
-    assert splits == stratified_event_split(events, 17)
-    assert splits != stratified_event_split(events, 18)
-    assert {name: len(indices) for name, indices in splits.items()} == {"train": 12, "validation": 4, "test": 4}
-    all_indices = [i for indices in splits.values() for i in indices]
-    assert sorted(all_indices) == list(range(20))
-    for indices in splits.values():
-        assert {events[i].targets.item() for i in indices} == {0, 1}
-    with pytest.raises(ValueError, match="at least 3"):
-        stratified_event_split(events[:2], 0)
 
 
 @pytest.mark.parametrize("view", ["FullReco", "L1T"])
@@ -327,13 +314,19 @@ def test_training_cli_saves_reloadable_best_checkpoint(tmp_path, view):
         pq.write_table(pa.Table.from_pylist(rows), path)
         sources[name] = path
     output = tmp_path / "training"
-    command = [sys.executable, str(root / "scripts/train_foundation_smoke.py"),
+    command = [sys.executable, str(root / "scripts/run_classification.py"),
                "--view", view, "--model-config", str(root / "configs/models/foundation_tiny.yaml"),
                "--max-events-per-class", "10", "--epochs", "2", "--batch-size", "4",
-               "--learning-rate", "0.001", "--seed", "7", "--output-dir", str(output)]
+               "--num-workers", "2" if view == "FullReco" else "0",
+               "--device", "cpu", "--seed", "7", "--output-dir", str(output)]
     for name, path in sources.items():
         command.extend(["--process", f"{name}={path}"])
     env = dict(os.environ, PYTHONPATH=str(root / "src"), HF_HUB_OFFLINE="1", HF_DATASETS_OFFLINE="1")
+    inspected = subprocess.run(command + ["--stage", "inspect"], cwd=root, env=env,
+                               capture_output=True, text=True, timeout=60)
+    assert inspected.returncode == 0, inspected.stderr
+    assert (output / "preflight.json").is_file()
+    assert not (output / "checkpoint.pt").exists()
     result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     assert "Epoch 2/2" in result.stdout
@@ -341,17 +334,14 @@ def test_training_cli_saves_reloadable_best_checkpoint(tmp_path, view):
     checkpoint = torch.load(output / "checkpoint.pt", map_location="cpu", weights_only=True)
     assert metrics["view"] == view
     assert metrics["split_sizes"] == {"train": 12, "validation": 4, "test": 4}
-    assert metrics["diagnostics"]["embedding_shape"] == [4, 64]
-    assert metrics["diagnostics"]["logits_shape"] == [4, 2]
-    assert metrics["diagnostics"]["all_features_finite"]
-    assert metrics["diagnostics"]["tokens_embeddings_logits_finite"]
-    assert metrics["finite_gradients"]
-    assert metrics["files_read"] == sorted(map(str, sources.values()))
-    assert len(metrics["event_sources"]) == 20
+    assert metrics["diagnostics"]["num_events"] == 20
+    assert metrics["device"] == "cpu"
+    manifest = json.loads((output / "dataset_manifest.json").read_text())
+    assert sorted(file["path"] for process in manifest["processes"] for file in process["files"]) == sorted(map(str, sources.values()))
     assert all(math.isfinite(epoch["train_loss"]) for epoch in metrics["history"])
     best = min(metrics["history"], key=lambda epoch: epoch["validation"]["loss"])
     assert metrics["best_epoch"] == checkpoint["best_epoch"] == best["epoch"]
-    for split in ("train", "validation", "test"):
+    for split in ("validation", "test"):
         assert math.isfinite(metrics[split]["loss"])
         assert 0 <= metrics[split]["accuracy"] <= 1
     cfg = dict(checkpoint["config"]["model"])
@@ -360,12 +350,28 @@ def test_training_cli_saves_reloadable_best_checkpoint(tmp_path, view):
         FoundationEncoder(checkpoint["collection_feature_dims"], PerceiverConfig(**cfg)), 2,
     ).eval()
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-    specs = default_collection_specs(checkpoint["config"]["data"]["collection_limits"])
-    events, _ = load_process_events(sources, view, specs, max_events_per_class=10)
-    test_batch = collate_event_batches([events[i] for i in metrics["split_indices"]["test"]])
+    test_batch = collate_event_batches(list(StreamingDataset(manifest, "test")))
     with torch.no_grad():
+        embeddings = model.encode(test_batch)
         logits = model(test_batch)
+    assert embeddings.shape == (4, 64)
+    assert logits.shape == (4, 2)
+    assert torch.isfinite(embeddings).all() and torch.isfinite(logits).all()
     assert torch.nn.functional.cross_entropy(logits, test_batch.targets).item() == pytest.approx(metrics["test"]["loss"], abs=1e-6)
     assert (logits.argmax(1) == test_batch.targets).float().mean().item() == pytest.approx(metrics["test"]["accuracy"])
     config = yaml.safe_load((root / "configs/models/foundation_tiny.yaml").read_text())
-    assert checkpoint["config"] == config
+    assert checkpoint["config"]["model"] == config["model"]
+    evaluation = tmp_path / "evaluation"
+    result = subprocess.run([
+        sys.executable, str(root / "scripts/run_classification.py"), "--stage", "evaluate",
+        "--checkpoint", str(output / "checkpoint.pt"), "--device", "cpu", "--output-dir", str(evaluation),
+    ], cwd=root, env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    reloaded = json.loads((evaluation / "metrics.json").read_text())
+    assert reloaded["test"]["confusion_matrix"] == metrics["test"]["confusion_matrix"]
+    assert reloaded["test"]["loss"] == pytest.approx(metrics["test"]["loss"], abs=1e-6)
+    result = subprocess.run([
+        sys.executable, str(root / "scripts/run_classification.py"), "--stage", "report", "--output-dir", str(output),
+    ], cwd=root, env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert (output / "report.html").is_file()

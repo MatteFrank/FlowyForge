@@ -3,13 +3,13 @@ from pathlib import Path
 from flowyforge.core.config import load_config, load_yaml
 
 
-def test_load_local_mac_config() -> None:
+def test_load_run_config_yaml() -> None:
     repo_root = Path(__file__).resolve().parents[1]
 
-    config = load_config(repo_root / "configs" / "local_mac.yaml")
+    config = load_config(repo_root / "configs" / "runs" / "classification.yaml")
 
-    assert config["data"]["backend"] == "local"
-    assert config["data"]["max_events"] == 500
+    assert config["mode"] == "small"
+    assert config["sources"]["small"]["max_events_per_class"] == 128
 
 
 def test_load_empty_yaml_returns_empty_dict(tmp_path: Path) -> None:

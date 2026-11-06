@@ -8,9 +8,12 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from torch.utils.data import DataLoader
 
 from flowyforge.data_plugins.collide_v2 import streaming
 from flowyforge.data_plugins.collide_v2.streaming import StreamingDataset, build_manifest, inspect_dataset
+from flowyforge.data_plugins.collide_v2.object_dataset import collate_event_batches
+from flowyforge.training.classification_run import _init_worker
 
 
 LIMITS = {"PUPPIPart": 0, "JetPuppiAK4": 0, "Electron": 0,
@@ -72,6 +75,18 @@ def test_full_mode_has_no_event_index_and_workers_do_not_duplicate(tmp_path, mon
         parts.append(identities(StreamingDataset(manifest, "train", read_batch_size=3)))
     assert set.union(*parts) == expected
     assert sum(len(part) for part in parts) == len(expected)
+
+
+def test_spawn_workers_replay_the_same_rows_as_single_process(tmp_path):
+    manifest = build_manifest(make_sources(tmp_path, rows=3), collection_limits=LIMITS)
+    expected = identities(StreamingDataset(manifest, "train", read_batch_size=2))
+    loader = DataLoader(StreamingDataset(manifest, "train", read_batch_size=2),
+                        batch_size=2, num_workers=2, multiprocessing_context="spawn",
+                        collate_fn=collate_event_batches, worker_init_fn=_init_worker, timeout=15)
+    sources = [metadata for batch in loader for metadata in batch.metadata["events"]]
+    actual = {(row["source_file"], row["source_row"]) for row in sources}
+    assert actual == expected
+    assert len(actual) == len(sources)
 
 
 def test_audit_units_missing_values_and_truncation(tmp_path):

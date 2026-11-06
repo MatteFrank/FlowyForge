@@ -1,4 +1,4 @@
-"""Safe helpers for materializing tiny COLLIDE-1M Hugging Face subsets."""
+"""Bounded raw Hugging Face exports for the structured Perceiver pipeline."""
 
 from __future__ import annotations
 
@@ -7,25 +7,29 @@ import math
 import re
 from itertools import islice
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-
-DEFAULT_SUMMARY_COLUMNS = [
-    "FullReco_MET_MET",
-    "FullReco_MET_Phi",
-    "FullReco_JetAK4_PT",
-    "FullReco_Electron_PT",
-    "FullReco_MuonTight_PT",
-    "L1T_MET_MET",
-    "L1T_JetAK4_PT",
-]
 MAX_ROWS_RAW_MODE = 100
-MAX_ROWS_PER_CHUNK = 10
+
+
+def _limits(rows: int, files: int) -> None:
+    if type(rows) is not int or not 1 <= rows <= MAX_ROWS_RAW_MODE:
+        raise ValueError(f"Raw HF materialization needs 1 <= max_rows <= {MAX_ROWS_RAW_MODE} per process.")
+    if type(files) is not int or files < 1:
+        raise ValueError("max_files must be a positive integer.")
+
+
+def _empty_output(path: Path) -> None:
+    if path.exists() and (not path.is_dir() or any(path.iterdir())):
+        raise FileExistsError(f"Refusing to overwrite existing HF export: {path}. Choose an empty output directory.")
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    path.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
 def materialize_hf_collide1m_subset(
@@ -34,123 +38,59 @@ def materialize_hf_collide1m_subset(
     output_dir: str | Path,
     max_rows: int = 20,
     max_files: int = 1,
-    seed: int = 42,
     data_dir: str | None = None,
     data_files: str | list[str] | None = None,
     columns: list[str] | None = None,
-    materialization_mode: str = "summary",
-    process_id: int | None = None,
+    cache_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Materialize a small streaming HF subset as local parquet.
+    """Preserve nested columns from the first bounded rows of a streamed process.
 
-    Summary mode is the safe default: selected variable-length columns are
-    converted into scalar event-level statistics before writing parquet.
+    This is a small raw export, not full-dataset downloading or uniform sampling
+    over the remote repository. Infer one Arrow schema over the entire bounded
+    sample so initially empty lists do not fix later chunks to null-only types.
     """
-
-    if max_rows < 0:
-        raise ValueError("max_rows must be non-negative.")
-    if max_files <= 0:
-        raise ValueError("max_files must be positive.")
-    if materialization_mode not in {"summary", "raw"}:
-        raise ValueError("materialization_mode must be either 'summary' or 'raw'.")
-    if materialization_mode == "raw" and max_rows > MAX_ROWS_RAW_MODE:
-        raise ValueError(
-            f"Raw HF materialization is capped at {MAX_ROWS_RAW_MODE} rows. "
-            "Use summary mode for safer smoke tests."
-        )
-
+    _limits(max_rows, max_files)
+    if not data_dir and data_files is None:
+        raise ValueError("Select a process with data_dir or explicit data_files.")
+    output = Path(output_dir).expanduser()
+    _empty_output(output)
     try:
         from datasets import load_dataset
     except ImportError as exc:
-        raise ImportError("Install with: pip install datasets huggingface_hub") from exc
-
-    output_path = Path(output_dir).expanduser()
-    output_path.mkdir(parents=True, exist_ok=True)
-    summary_columns = columns or DEFAULT_SUMMARY_COLUMNS
-
-    dataset = _load_streaming_dataset(
-        load_dataset=load_dataset,
-        dataset_name=dataset_name,
-        split=split,
-        data_dir=data_dir,
-        data_files=data_files,
-        columns=summary_columns if materialization_mode == "summary" else columns,
-    )
-    _clear_previous_materialization(output_path)
-
-    rows_written = 0
-    parquet_files: list[str] = []
-    writer: pq.ParquetWriter | None = None
-    current_file_index = 0
-    rows_in_current_file = 0
-    rows_per_file = max(1, math.ceil(max_rows / max_files)) if max_rows else 1
-
-    try:
-        row_iter = iter(dataset)
-        while rows_written < max_rows and current_file_index < max_files:
-            rows_to_take = min(
-                MAX_ROWS_PER_CHUNK,
-                max_rows - rows_written,
-                rows_per_file - rows_in_current_file,
-            )
-            if rows_to_take <= 0:
-                if writer is not None:
-                    writer.close()
-                    writer = None
-                current_file_index += 1
-                rows_in_current_file = 0
-                continue
-
-            raw_rows = list(islice(row_iter, rows_to_take))
-            if not raw_rows:
-                break
-            if materialization_mode == "summary":
-                rows = [
-                    summarize_hf_event_row(
-                        row,
-                        columns=summary_columns,
-                        process_name=data_dir,
-                        process_id=process_id if process_id is not None else _stable_process_id(data_dir),
-                        event_id=rows_written + offset,
-                    )
-                    for offset, row in enumerate(raw_rows)
-                ]
-            else:
-                rows = raw_rows
-
-            table = pa.Table.from_pandas(pd.DataFrame(rows), preserve_index=False)
-            if writer is None:
-                parquet_name = f"part-{current_file_index:05d}.parquet"
-                parquet_path = output_path / parquet_name
-                writer = pq.ParquetWriter(parquet_path, table.schema)
-                parquet_files.append(parquet_name)
-            writer.write_table(table)
-            chunk_rows = len(rows)
-            rows_written += chunk_rows
-            rows_in_current_file += chunk_rows
-    finally:
-        if writer is not None:
-            writer.close()
-
+        raise ImportError("Install the Hugging Face dependencies with pip install -r requirements.txt") from exc
+    kwargs: dict[str, Any] = {"split": split, "streaming": True}
+    if data_dir:
+        kwargs["data_dir"] = data_dir
+    if data_files is not None:
+        kwargs["data_files"] = data_files
+    if columns is not None:
+        kwargs["columns"] = columns
+    if cache_dir is not None:
+        kwargs["cache_dir"] = str(Path(cache_dir).expanduser())
+    rows = list(islice(load_dataset(dataset_name, **kwargs), max_rows))
+    if not rows:
+        raise ValueError(f"No events returned for HF process {data_dir or data_files}.")
+    # HF rows can differ in optional fields; never silently discard a later key.
+    names = list(dict.fromkeys(key for row in rows for key in row))
+    table = pa.Table.from_pylist([{name: row.get(name) for name in names} for row in rows])
+    rows_per_file = math.ceil(len(rows) / max_files)
+    files = []
+    for index, offset in enumerate(range(0, len(rows), rows_per_file)):
+        name = f"part-{index:05d}.parquet"
+        pq.write_table(table.slice(offset, rows_per_file), output / name)
+        files.append(name)
     manifest = {
-        "dataset_name": dataset_name,
-        "source_dataset_name": dataset_name,
-        "split": split,
-        "seed": seed,
-        "data_dir": data_dir,
-        "data_files": data_files,
-        "max_rows": max_rows,
-        "max_files": max_files,
-        "materialization_mode": materialization_mode,
-        "summary_columns": summary_columns,
-        "rows_written": rows_written,
-        "parquet_files": parquet_files,
-        "warning": "Streaming tiny subset only; never use this helper to download the full COLLIDE-1M dataset.",
+        "dataset_name": dataset_name, "split": split, "data_dir": data_dir,
+        "data_files": data_files, "materialization_mode": "raw", "columns": names,
+        "rows_written": len(rows), "parquet_files": files,
+        "sampling": "first rows of remote stream, capped before export",
     }
-    manifest_path = output_path / "hf_subset_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    manifest["manifest_path"] = str(manifest_path)
+    _write_manifest(output / "hf_subset_manifest.json", manifest)
     return manifest
+
+
+def _safe_process_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-") or "process"
 
 
 def materialize_hf_collide1m_multi_process_subset(
@@ -161,201 +101,68 @@ def materialize_hf_collide1m_multi_process_subset(
     max_rows_per_process: int = 20,
     max_files_per_process: int = 1,
     columns: list[str] | None = None,
-    materialization_mode: str = "summary",
-    seed: int = 42,
+    cache_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Materialize tiny summary parquet files for several HF process folders."""
-
-    if not data_dirs:
-        raise ValueError("data_dirs must contain at least one HF process folder.")
-    if max_rows_per_process < 0:
-        raise ValueError("max_rows_per_process must be non-negative.")
-    if max_files_per_process <= 0:
-        raise ValueError("max_files_per_process must be positive.")
-
-    output_path = Path(output_dir).expanduser()
-    output_path.mkdir(parents=True, exist_ok=True)
-    _clear_previous_materialization(output_path)
-
-    process_to_id = {data_dir: index for index, data_dir in enumerate(data_dirs)}
-    rows_written_per_process: dict[str, int] = {}
-    parquet_files: list[str] = []
-    errors: dict[str, str] = {}
-
-    for data_dir, process_index in process_to_id.items():
-        process_folder = _safe_process_name(data_dir)
-        process_output_dir = output_path / process_folder
+    """Export each process separately; partial failures are reported and raised."""
+    _limits(max_rows_per_process, max_files_per_process)
+    if not data_dirs or any(not isinstance(name, str) or not name.strip() for name in data_dirs):
+        raise ValueError("Provide nonempty HF process directory names.")
+    folders = [_safe_process_name(name) for name in data_dirs]
+    if len({name.casefold() for name in folders}) != len(data_dirs):
+        raise ValueError("HF process names must map to distinct output folders.")
+    output = Path(output_dir).expanduser()
+    _empty_output(output)
+    counts, errors, files = {}, {}, []
+    for name, folder in zip(data_dirs, folders):
         try:
-            process_manifest = materialize_hf_collide1m_subset(
-                dataset_name=dataset_name,
-                split=split,
-                output_dir=process_output_dir,
-                max_rows=max_rows_per_process,
-                max_files=max_files_per_process,
-                seed=seed,
-                data_dir=data_dir,
-                columns=columns,
-                materialization_mode=materialization_mode,
-                process_id=process_index,
+            part = materialize_hf_collide1m_subset(
+                dataset_name, split, output / folder, max_rows=max_rows_per_process,
+                max_files=max_files_per_process, data_dir=name, columns=columns, cache_dir=cache_dir,
             )
-        except Exception as exc:  # noqa: BLE001 - keep other processes materializing.
-            rows_written_per_process[data_dir] = 0
-            errors[data_dir] = f"{exc.__class__.__name__}: {exc}"
-            continue
-
-        rows_written = int(process_manifest.get("rows_written", 0))
-        rows_written_per_process[data_dir] = rows_written
-        if rows_written <= 0:
-            errors[data_dir] = "No rows materialized."
-            continue
-        parquet_files.extend(
-            f"{process_folder}/{parquet_name}"
-            for parquet_name in process_manifest.get("parquet_files", [])
-        )
-
-    processes_materialized = sum(1 for rows in rows_written_per_process.values() if rows > 0)
-    warning = "Streaming tiny subset only; never use this helper to download the full COLLIDE-1M dataset."
-    if processes_materialized < 2:
-        warning += " Only one class materialized; classification training will be skipped or fail gracefully."
-
+            counts[name] = part["rows_written"]
+            files.extend(f"{folder}/{filename}" for filename in part["parquet_files"])
+        except Exception as exc:  # Preserve a usable failure manifest for remote IO errors.
+            counts[name] = 0
+            errors[name] = f"{type(exc).__name__}: {exc}"
     manifest = {
-        "dataset_name": dataset_name,
-        "split": split,
-        "seed": seed,
-        "data_dirs": data_dirs,
-        "process_to_id": process_to_id,
-        "rows_written_per_process": rows_written_per_process,
-        "parquet_files": parquet_files,
-        "materialization_mode": materialization_mode,
-        "summary_columns": columns or DEFAULT_SUMMARY_COLUMNS,
-        "processes_requested": len(data_dirs),
-        "processes_materialized": processes_materialized,
-        "classification_possible": processes_materialized >= 2,
-        "errors": errors,
-        "warning": warning,
+        "dataset_name": dataset_name, "split": split, "materialization_mode": "raw",
+        "process_folders": dict(zip(data_dirs, folders)), "rows_written_per_process": counts,
+        "parquet_files": files, "errors": errors,
+        "processes_materialized": sum(count > 0 for count in counts.values()),
     }
-    manifest_path = output_path / "hf_multi_subset_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    manifest["manifest_path"] = str(manifest_path)
-
-    if processes_materialized == 0:
-        raise RuntimeError(f"No HF processes were materialized successfully. Errors: {errors}")
+    _write_manifest(output / "hf_multi_subset_manifest.json", manifest)
+    if errors:
+        raise RuntimeError(f"Incomplete HF export; inspect {output / 'hf_multi_subset_manifest.json'}: {errors}")
     return manifest
 
 
-def summarize_hf_event_row(
-    row: dict[str, Any],
-    columns: list[str],
-    process_name: str | None = None,
-    process_id: int | None = None,
-    event_id: int | None = None,
-) -> dict[str, Any]:
-    """Convert one HF event row with array-like values into scalar summaries."""
-
-    summary: dict[str, Any] = {"event_id": int(event_id or 0)}
-    if process_name is not None:
-        summary["process_name"] = process_name
-    if process_id is not None:
-        summary["process_id"] = int(process_id)
-
-    for column in columns:
-        values = _to_numeric_array(row.get(column))
-        summary[f"{column}_len"] = int(values.size)
-        if values.size == 0:
-            summary[f"{column}_mean"] = 0.0
-            summary[f"{column}_std"] = 0.0
-            summary[f"{column}_min"] = 0.0
-            summary[f"{column}_max"] = 0.0
-            summary[f"{column}_sum"] = 0.0
-            continue
-        summary[f"{column}_mean"] = float(values.mean())
-        summary[f"{column}_std"] = float(values.std())
-        summary[f"{column}_min"] = float(values.min())
-        summary[f"{column}_max"] = float(values.max())
-        summary[f"{column}_sum"] = float(values.sum())
-    return summary
+def prepare_hf_source(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Prepare the raw source described by configs/paths/hf_collide1m_raw.yaml."""
+    if unknown := set(config) - {"paths", "data"}:
+        raise ValueError(f"Unknown preparation sections: {sorted(unknown)}. Use the raw-only HF config.")
+    paths, data = config["paths"], config.get("data", {})
+    if paths.get("dataset_backend") != "hf":
+        raise ValueError("Preparation is only needed for the hf backend; mounted Parquet goes directly to run_classification.py.")
+    allowed_paths = {"dataset_backend", "hf_dataset_name", "hf_split", "hf_data_dirs", "dataset_dir", "local_cache_dir"}
+    if unknown := set(paths) - allowed_paths:
+        raise ValueError(f"Unknown preparation paths: {sorted(unknown)}")
+    if unknown := set(data) - {"max_rows_per_process", "max_files"}:
+        raise ValueError(f"Unknown preparation data settings: {sorted(unknown)}. Only raw nested exports are supported.")
+    directories = paths.get("hf_data_dirs")
+    if not isinstance(directories, list) or len(directories) < 2:
+        raise ValueError("Configure at least two hf_data_dirs for classification.")
+    rows = data.get("max_rows_per_process", 20)
+    _limits(rows, data.get("max_files", 1))
+    if rows < 3:
+        raise ValueError("Classification requires at least 3 events per process.")
+    manifest = materialize_hf_collide1m_multi_process_subset(
+        paths["hf_dataset_name"], paths.get("hf_split", "train"), paths["dataset_dir"], directories,
+        max_rows_per_process=rows, max_files_per_process=data.get("max_files", 1),
+        cache_dir=paths.get("local_cache_dir"),
+    )
+    if any(count < 3 for count in manifest["rows_written_per_process"].values()):
+        raise ValueError("HF export contains fewer than 3 events in a process; inspect the export manifest.")
+    return manifest
 
 
-def _load_streaming_dataset(
-    load_dataset: Any,
-    dataset_name: str,
-    split: str,
-    data_dir: str | None,
-    data_files: str | list[str] | None,
-    columns: list[str] | None,
-) -> Any:
-    kwargs: dict[str, Any] = {"split": split, "streaming": True}
-    if data_dir is not None:
-        kwargs["data_dir"] = data_dir
-    if data_files is not None:
-        kwargs["data_files"] = data_files
-    if columns is not None:
-        kwargs["columns"] = columns
-    try:
-        return load_dataset(dataset_name, **kwargs)
-    except TypeError:
-        kwargs.pop("columns", None)
-        return load_dataset(dataset_name, **kwargs)
-
-
-def _clear_previous_materialization(output_path: Path) -> None:
-    for parquet_path in output_path.rglob("part-*.parquet"):
-        parquet_path.unlink()
-    for manifest_path in output_path.rglob("hf_subset_manifest.json"):
-        manifest_path.unlink()
-    multi_manifest_path = output_path / "hf_multi_subset_manifest.json"
-    if multi_manifest_path.exists():
-        multi_manifest_path.unlink()
-
-
-def _safe_process_name(process_name: str) -> str:
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", process_name).strip("._-")
-    return safe_name or "process"
-
-
-def _to_numeric_array(value: Any) -> np.ndarray:
-    if value is None:
-        return np.asarray([], dtype=np.float64)
-    if hasattr(value, "to_numpy"):
-        value = value.to_numpy()
-    elif hasattr(value, "tolist"):
-        value = value.tolist()
-    try:
-        array = np.asarray(value, dtype=np.float64).reshape(-1)
-    except (TypeError, ValueError):
-        array = np.asarray(list(_iter_numeric_values(value)), dtype=np.float64)
-    if array.size == 0:
-        return array.astype(np.float64)
-    return array[np.isfinite(array)]
-
-
-def _iter_numeric_values(value: Any) -> Any:
-    if value is None or isinstance(value, (str, bytes)):
-        return
-    try:
-        iterator = iter(value)
-    except TypeError:
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return
-        if math.isfinite(number):
-            yield number
-        return
-
-    for item in iterator:
-        yield from _iter_numeric_values(item)
-
-
-def _stable_process_id(process_name: str | None) -> int | None:
-    if process_name is None:
-        return None
-    # Deterministic compact integer without relying on Python's randomized hash.
-    return sum(ord(char) for char in process_name) % 1_000_000
-
-
-__all__ = [
-    "materialize_hf_collide1m_multi_process_subset",
-    "materialize_hf_collide1m_subset",
-    "summarize_hf_event_row",
-]
+__all__ = ["materialize_hf_collide1m_subset", "materialize_hf_collide1m_multi_process_subset", "prepare_hf_source"]

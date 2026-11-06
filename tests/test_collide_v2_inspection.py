@@ -4,7 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import yaml
 
@@ -18,7 +19,7 @@ from flowyforge.data_plugins.collide_v2.schema_inspector import (
 
 def _write_parquet(path: Path, data: dict[str, list[object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(data).to_parquet(path, index=False)
+    pq.write_table(pa.table(data), path)
 
 
 def test_list_parquet_files(tmp_path: Path) -> None:

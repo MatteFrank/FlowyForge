@@ -1,6 +1,0 @@
-data:
-  backend: local
-  base_path: data/samples/collide_v2_tiny
-  max_files: 1
-  max_events: 500
-

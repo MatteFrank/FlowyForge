@@ -1,0 +1,21 @@
+# Same runner/model as local and EOS, using the prepared nested HF sample.
+# Keep these paths aligned with configs/paths/hf_collide1m_raw.yaml.
+mode: small
+model_config: ../models/foundation_tiny.yaml
+output_dir: outputs/perceiver/hf
+seed: 42
+sources:
+  small:
+    processes:
+      WJets: data/hf_cache/collide-1m/perceiver_raw/WJetsToLNu_13TeV-madgraphMLM-pythia8
+      DYJets: data/hf_cache/collide-1m/perceiver_raw/DYJetsToLL_13TeV-madgraphMLM-pythia8
+    max_events_per_class: 20
+data:
+  view: FullReco
+  # Confirm these input units against the original data before scientific use.
+  units: {momentum: GeV, angle: rad}
+training:
+  epochs: 3
+  batch_size: 8
+  device: auto
+  num_workers: 0

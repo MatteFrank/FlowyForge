@@ -1,179 +1,191 @@
 # FlowyForge / M-Fond
 
-FlowyForge is a modular foundation platform for complex scientific data. The first fast-track path targets COLLIDE-2V / HEP workflows while keeping the package extensible to future datasets, task plugins, model plugins, and analysis tools.
+FlowyForge mantiene una sola pipeline di classificazione: **oggetti COLLIDE →
+ObjectTokenizer → Perceiver → embedding dell'evento → classification head**.
+Lo stesso runner legge piccoli campioni e dataset completi in streaming, allena
+su CPU/CUDA/MPS e produce valutazione e report. Il training è supervisionato da
+etichette di processo; non è ancora un foundation model preaddestrato.
 
-Current status: COLLIDE source inspection, the B1 scalar-summary/MLP baseline, and structured object classification (ObjectTokenizer -> latent Perceiver -> event embedding -> classification). A shared streaming runner supports small original Parquet samples and full mounted EOS datasets, with CPU/GPU execution and reports. Real COLLIDE-V2 schema/unit validation and full-scale runs remain to be performed on an authorized CERN node.
+La baseline B1/MLP, la vettorizzazione scalare, il preprocessing `.npy`, il vecchio
+runner HF B1 e il trainer foundation smoke duplicato sono stati rimossi. I dati e
+risultati già presenti sotto `data/` e `outputs/` non vengono migrati o cancellati.
 
-## Install
+## Installazione su macOS, Linux, Windows e HPC
 
-Use Python 3.10 or newer. From the repository root:
+Serve Python >= 3.10. Eseguire dalla radice del repository. Creare la venv sul
+sistema di destinazione: una venv non è trasferibile tra sistemi operativi.
+
+macOS/Linux, incluso un nodo LXPLUS/HPC con Python disponibile:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
+```
+
+Windows PowerShell:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Dopo l'attivazione, gli stessi comandi su ogni sistema:
+
+```text
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install --no-deps -e .
-```
-
-The requirements file installs portable Python dependencies, including PyTorch,
-pytest and the Hugging Face backend. The final command installs FlowyForge in
-editable mode so scripts can import the package under `src/`.
-For only the core dependencies, use `python -m pip install -e .` instead.
-
-### Linux, LXPLUS and HPC environments
-
-Create the virtual environment on the target system; do not copy a macOS venv
-to Linux or reuse one across incompatible cluster environments. If your site
-uses environment modules, load its Python environment before creating the venv,
-and use the same environment in batch jobs. Module names and available Python
-versions depend on the site.
-
-`requirements.txt` contains no local paths, macOS-only packages, CUDA version or
-custom package index. It can also be installed before the repository is available;
-run the editable project installation once you are in the repository root.
-This is a portable dependency list, not a lock file validated on every cluster.
-
-For GPU use, install the PyTorch build prescribed by your cluster for its driver
-and accelerator environment **before** installing the requirements. The plain
-`torch` requirement accepts an already installed build; it does not select or
-verify a CUDA version. The foundation smoke trainer currently runs on CPU even
-when CUDA is available. Installing a GPU build does not change that behavior.
-
-Check the environment on the node where you will run the workload:
-
-```bash
 python -m pip check
-python -c "import flowyforge, torch, pyarrow; print('PyTorch:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('PyArrow:', pyarrow.__version__)"
 python -m pytest -q tests/
 ```
 
-A CPU-only node may correctly report `CUDA available: False`. On clusters
-without outbound network access, install through the site's package mirror or
-an approved wheel directory; dependency installation needs to be completed
-before running offline jobs. EOS access and filesystem mounts are supplied by
-the cluster, not by this requirements file.
+Se non si usa l'attivazione, sostituire `python` con `.venv/bin/python` su
+macOS/Linux o `.venv\Scripts\python.exe` su Windows. I comandi di run qui sotto
+sono su una sola riga, senza continuazioni specifiche della shell. Racchiudere
+percorsi con spazi e glob tra doppi apici; su Windows si possono usare percorsi
+come `C:/data/processo/*.parquet`.
 
-## Test
+Su HPC caricare prima l'ambiente Python previsto dal sito e riusarlo nel job.
+Per GPU installare la build PyTorch indicata dal cluster prima dei requirements;
+il file non impone una versione CUDA. Non vengono installati driver o mount EOS.
+Le dipendenze HF sono necessarie solo per il download; per dati locali già pronti
+è sufficiente `python -m pip install -e .`. In assenza di rete utilizzare il mirror
+o le wheel approvate dal sito. Nessun comando invia automaticamente job al batch
+system del cluster.
 
-```bash
-pytest tests/
-```
+## Una pipeline, quattro stadi
 
-## Data Pipeline Status
-
-Current fast-track pipeline:
+Punto d'ingresso: **`scripts/run_classification.py`**.
 
 ```text
-Parquet -> inspect/manifest -> vectorize -> preprocess -> train tiny baseline -> evaluate/report
+Parquet nested → manifest/schema/unità → stream di EventBatch con masks
+              → ObjectTokenizer → Perceiver → classificazione
+              → validation/test → metriche, checkpoint, report
 ```
 
-Current supported backends:
+| Stadio | Cosa esegue |
+| --- | --- |
+| `--stage inspect` | Controlla gli schemi di tutti i file e campiona i valori; scrive manifest e preflight |
+| `--stage train` | Ripete il preflight, costruisce gli split, allena, seleziona la minima validation loss, valuta il test e produce il report |
+| `--stage evaluate` | Ricarica il checkpoint e rivaluta validation/test sugli stessi split del manifest |
+| `--stage report` | Rigenera CSV, figure e HTML da `metrics.json`, senza leggere i Parquet |
 
-- local tiny Parquet sample
-- Hugging Face materialized subset
-- mounted EOS paths on LXPLUS (streaming structured classification; B1 vectorization remains separate)
+`train` è autonomo rispetto a `inspect`, ma non scarica dati da HF. L'ispezione
+separata consente di verificare classi, schema e unità prima di impegnare risorse.
+**Non esistono più stadi vectorize/preprocess separati:** trasformazioni, padding
+ed estrazione delle feature avvengono nel reader, con la stessa configurazione
+per training e valutazione. Il modello accetta i nested originali, non i vecchi
+summary Parquet o gli array B1.
 
-Docs:
+| Sorgente | Preparazione | Config del run |
+| --- | --- | --- |
+| Esempio sintetico offline | `make_tiny_parquet_sample.py` | `configs/runs/local.yaml` |
+| Piccolo campione HF raw | `prepare_collide_source.py` | `configs/runs/hf.yaml` |
+| Parquet locali già pronti | Nessuna; configurare i processi | `configs/runs/classification.yaml` + `--process` |
+| Dataset su filesystem EOS/HPC | Nessuna; accesso ai file già disponibile | `configs/runs/classification.yaml` + `--mode eos` |
 
-- [Pipeline explained](docs/pipeline_explained.md)
-- [Vectorization](docs/vectorization.md)
-- [Preprocessing](docs/preprocessing.md)
-- [Training](docs/training.md)
-- [Evaluation](docs/evaluation.md)
-- [HF smoke pipeline](docs/hf_smoke_pipeline.md)
-- [HF multi-process classification](docs/hf_multi_process_classification.md)
-- [Structured foundation smoke: data contract, FullReco/L1T commands, outputs](docs/foundation_smoke.md)
-- [Small/EOS classification: preflight, pilot, full GPU run and reports](docs/classification_run.md)
+`small` ed `eos` scelgono i default di sorgente e campionamento, non il sistema
+operativo o il modello. Iperparametri di training: YAML del run. Architettura e
+limiti degli oggetti: `configs/models/foundation_tiny.yaml`.
 
-## Streaming Classification
+## Primo run offline, senza dataset esterni
 
-Use `scripts/run_classification.py` with `configs/runs/classification.yaml` for
-both `--mode small` and `--mode eos`. The stages `inspect`, `train`, `evaluate`
-and `report` cover schema/unit auditing, uniform sampling across files, bounded
-batch construction, CPU/GPU execution and reproducible evaluation. Outputs
-include CSV tables, PNG/PDF figures and a self-contained HTML report.
-
-The EOS root defaults to `/eos/project/f/foundational-model-dataset/samples/`.
-Start with `--stage inspect`; see the [detailed run guide](docs/classification_run.md)
-for exact commands, input contracts, memory controls and the limitations of
-preliminary unweighted results. The existing smoke and B1 paths below remain available.
-
-## Structured Foundation Smoke
-
-This path reads **original nested COLLIDE-V2 Parquet**, not the scalar-summary
-Parquet or vectorized arrays produced by B1. The existing B1 commands below
-remain unchanged. Both `--view FullReco` and `--view L1T` use the same object API;
-required column names and shapes are checked explicitly, without inferred aliases.
-
-```bash
-python scripts/train_foundation_smoke.py \
-  --process 'signal=/path/to/original/signal/*.parquet' \
-  --process 'background=/path/to/original/background/*.parquet' \
-  --view FullReco \
-  --model-config configs/models/foundation_tiny.yaml \
-  --max-events-per-class 128 --epochs 3 --batch-size 16 \
-  --learning-rate 0.001 --seed 42 \
-  --output-dir outputs/foundation_smoke/fullreco
+```text
+python scripts/make_tiny_parquet_sample.py
+python scripts/run_classification.py --config configs/runs/local.yaml --stage inspect
+python scripts/run_classification.py --config configs/runs/local.yaml --stage train --device cpu
+python scripts/run_classification.py --stage evaluate --checkpoint outputs/perceiver/local/checkpoint.pt --device cpu --output-dir outputs/perceiver/local_evaluation
+python scripts/run_classification.py --stage report --output-dir outputs/perceiver/local
 ```
 
-Replace the process paths with original nested files. Use `--view L1T` and a
-separate output directory for the other view. The CPU smoke saves `metrics.json`
-and `checkpoint.pt`; it needs at least two classes and three events per class.
-See the [foundation smoke guide](docs/foundation_smoke.md) for the exact schema,
-collection limits, diagnostics and manual LXPLUS commands.
+Il generatore crea 40 eventi per classe, due classi, sei collections e entrambe
+le viste FullReco/L1T sotto `data/samples/perceiver_tiny`. È un esempio del
+contratto dati, non una simulazione fisica. Non sovrascrive directory non vuote.
+Per ripetere il training scegliere un nuovo `--output-dir`; una directory usata
+soltanto da `inspect` può essere riutilizzata da `train`.
 
-## Smoke Commands
+## Hugging Face: raw → Perceiver
 
-```bash
-python scripts/make_tiny_parquet_sample.py --config configs/paths/local.yaml
-python scripts/prepare_collide_source.py --config configs/paths/local.yaml
-python scripts/inspect_dataset.py --config configs/paths/local.yaml
-python scripts/vectorize_collide.py --config configs/paths/local.yaml
-python scripts/preprocess_collide.py --config configs/paths/local.yaml
-python scripts/train_task.py --config configs/paths/local.yaml --task classification --model mlp
-python scripts/evaluate_task.py --config configs/paths/local.yaml --task classification --model mlp
-```
+Controllare i processi disponibili e il config di preparazione:
 
-## HF Small Sample
-
-```bash
-pip install datasets huggingface_hub
-jupyter notebook notebooks/00_hf_collide1m_quickstart.ipynb
-python scripts/prepare_collide_source.py --config configs/paths/hf_collide1m.yaml
-python scripts/inspect_dataset.py --config configs/paths/hf_collide1m.yaml
-python scripts/vectorize_collide.py --config configs/paths/hf_collide1m.yaml
-python scripts/preprocess_collide.py --config configs/paths/hf_collide1m.yaml
-```
-
-## HF Smoke Pipeline
-
-The default HF config materializes two tiny process folders, enough to exercise the classification path. Use the listing helper if you want to replace or extend `paths.hf_data_dirs`.
-
-```bash
-pip install datasets huggingface_hub
+```text
 python scripts/list_hf_collide_dirs.py --max-dirs 30
+python scripts/prepare_collide_source.py --config configs/paths/hf_collide1m_raw.yaml
+python scripts/run_classification.py --config configs/runs/hf.yaml --stage inspect
+python scripts/run_classification.py --config configs/runs/hf.yaml --stage train --device auto
+python scripts/run_classification.py --stage evaluate --checkpoint outputs/perceiver/hf/checkpoint.pt --device auto --output-dir outputs/perceiver/hf_evaluation
 ```
 
-Keep at least two entries under `paths.hf_data_dirs` for a tiny classification smoke sample.
+La preparazione legge fino a 20 righe per processo in streaming remoto e conserva
+le colonne nested in `data/hf_cache/collide-1m/perceiver_raw`. Il limite di questo
+helper è 100 eventi per processo. Non produce statistiche scalari né allena il
+modello. Un export incompleto causa errore e lascia un manifest diagnostico.
+Un export esistente è protetto; per scaricare un nuovo campione cambiare
+`paths.dataset_dir` e i percorsi corrispondenti in `configs/runs/hf.yaml`.
 
-```bash
-python scripts/prepare_collide_source.py --config configs/paths/hf_collide1m.yaml
-python scripts/inspect_dataset.py --config configs/paths/hf_collide1m.yaml
-python scripts/vectorize_collide.py --config configs/paths/hf_collide1m.yaml
-python scripts/preprocess_collide.py --config configs/paths/hf_collide1m.yaml
-python scripts/run_hf_smoke_pipeline.py --config configs/paths/hf_collide1m.yaml
+I nomi di processo nel repository HF e lo schema reale vanno verificati: la
+preparazione raw non garantisce che tutte le collections richieste siano presenti.
+Il preflight controlla nomi e tipi esatti, senza alias di colonne inventati.
+Il campione remoto contiene le prime righe ricevute; il runner campiona
+uniformemente solo **all'interno dei file esportati**.
+
+Per L1T aggiungere `--view L1T` a inspect/train e usare una nuova directory:
+
+```text
+python scripts/run_classification.py --config configs/runs/hf.yaml --stage train --view L1T --device auto --output-dir outputs/perceiver/hf_l1t
 ```
 
-If `y.npy` exists with at least two classes, training and evaluation can run. If `y.npy` is absent or contains only one class, the HF smoke pipeline still succeeds as X-only or single-class validation.
+## EOS/LXPLUS o altro filesystem HPC
 
-## B1 EOS Inspection / Vectorization
+Su un nodo autorizzato dove i Parquet sono leggibili come file locali, controllare
+il percorso e i processi. Il root seguente è il default del progetto, da confermare
+sul sito. Nessun accesso EOS viene eseguito dall'installazione o dai test.
 
-```bash
-python scripts/inspect_dataset.py --config configs/paths/eos.yaml
-python scripts/vectorize_collide.py --config configs/paths/eos.yaml
+```text
+python scripts/run_classification.py --mode eos --stage inspect --data-root /eos/project/f/foundational-model-dataset/samples/ --output-dir outputs/perceiver/eos_pilot
+python scripts/run_classification.py --mode eos --stage train --data-root /eos/project/f/foundational-model-dataset/samples/ --max-events-per-class 1000 --epochs 3 --batch-size 16 --device auto --output-dir outputs/perceiver/eos_pilot
 ```
 
-The B1 pploner-style flow is preserved as `Parquet -> vectorized .npy -> preprocessing -> training`.
-For structured streaming classification on the full EOS dataset, use the new
-[classification runner](docs/classification_run.md).
+Il discovery interpreta le directory dei processi come classi: verificare
+`dataset_manifest.json`. Per scegliere solo alcune classi aggiungere
+`--process-name NOME` ripetuto. Se il layout è diverso, passare mapping espliciti
+con `--process "classe_a=/percorso/a" --process "classe_b=/percorso/b"`.
+Su HPC-bubble o un altro cluster cambiano solo i percorsi e le risorse disponibili;
+non occorre codice specifico per il cluster. Non sono supportati URL `root://`.
+
+Dopo il pilot, esempio di full run su nodo GPU:
+
+```text
+python scripts/run_classification.py --mode eos --stage train --data-root /eos/project/f/foundational-model-dataset/samples/ --max-events-per-class 0 --epochs 20 --batch-size 64 --device cuda:0 --output-dir outputs/perceiver/eos_full
+python scripts/run_classification.py --stage evaluate --checkpoint outputs/perceiver/eos_full/checkpoint.pt --device cuda:0 --output-dir outputs/perceiver/eos_full_evaluation
+```
+
+`--max-events-per-class 0` include tutti gli eventi dei processi selezionati.
+Il reader costruisce batch progressivamente; non carica tutti gli eventi in RAM.
+La scansione iniziale dei footer interessa comunque tutti i file selezionati.
+
+## Device, output e limiti
+
+`--device auto` sceglie CUDA, poi MPS, poi CPU. `--device cpu` è il riferimento
+portabile; `--device cuda:0` e `--device mps` richiedono un backend disponibile.
+Il supporto nel codice non equivale a una verifica su ogni hardware/cluster.
+La suite locale valida il percorso CPU; la disponibilità si può controllare con:
+
+```text
+python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('MPS:', torch.backends.mps.is_available())"
+```
+
+Ogni training salva `resolved_config.yaml`, `dataset_manifest.json`,
+`preflight.json`, `checkpoint.pt`, `history.json`, `metrics.json`, `report.html`,
+`tables/` e `plots/` (CSV, PNG/PDF). Aprire `report.html` con un browser; il report
+non richiede un server. Conservare i file del run insieme e mantenere accessibili
+i Parquet originali per `evaluate`. Il manifest congela percorsi e fingerprint:
+la rilocazione dei dati tra macchine non è automatica.
+
+Il checkpoint è per inferenza/valutazione, senza resume del training. Training su
+un singolo device, niente DDP o pesi fisici; split per riga, senza deduplicazione
+di eventi fisici tra file. Accuracy/F1 su campioni piccoli non sono un benchmark.
+Schema, unità e prestazioni reali COLLIDE-V2 richiedono una validazione sul sito.
+
+- [Guida dettagliata: sampling, split, unità, memoria e valutazione](docs/classification_run.md)
+- [Architettura Perceiver e contratto delle collections](docs/perceiver.md)

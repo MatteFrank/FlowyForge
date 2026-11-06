@@ -1,36 +1,29 @@
 from pathlib import Path
 
-from flowyforge.core.config import load_config
-from flowyforge.data_plugins.collide_v2.source_resolver import resolve_dataset_source
+from flowyforge.core.config import load_yaml
+from flowyforge.training.classification_run import load_run_config
+
+REPO = Path(__file__).resolve().parents[1]
 
 
-def test_local_path_config_loads() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
+def test_local_run_points_to_nested_sample():
+    config = load_run_config(REPO / 'configs/runs/local.yaml')
+    assert config['source']['processes'] == {
+        'background': 'data/samples/perceiver_tiny/background',
+        'signal': 'data/samples/perceiver_tiny/signal',
+    }
+    assert config['model']['name'] == 'foundation_tiny'
 
-    config = load_config(repo_root / "configs" / "paths" / "local.yaml")
 
-    assert config["paths"]["dataset_backend"] == "local"
-    assert config["paths"]["dataset_dir"] == "data/samples/collide2v_tiny"
-    assert config["data"]["max_files"] == 2
-
-
-def test_hf_path_config_loads_without_downloading() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-
-    config = load_config(repo_root / "configs" / "paths" / "hf_collide1m.yaml")
-    source = resolve_dataset_source(config)
-
-    assert source.backend == "hf"
-    assert source.hf_dataset_name == "fastmachinelearning/collide-1m"
-    assert source.hf_split == "train"
-    assert source.hf_data_dir == "WJetsToLNu_13TeV-madgraphMLM-pythia8"
-    assert source.hf_data_dirs == [
-        "WJetsToLNu_13TeV-madgraphMLM-pythia8",
-        "DYJetsToLL_13TeV-madgraphMLM-pythia8",
-    ]
-    assert isinstance(source.parquet_files, list)
-    assert config["data"]["materialize_local_parquet"] is True
-    assert config["data"]["max_rows"] is None
-    assert config["data"]["max_rows_per_process"] == 20
-    assert config["data"]["max_files"] == 1
-    assert config["data"]["hf_materialization_mode"] == "summary"
+def test_hf_preparation_and_training_configs_agree_without_downloading():
+    preparation = load_yaml(REPO / 'configs/paths/hf_collide1m_raw.yaml')
+    run = load_run_config(REPO / 'configs/runs/hf.yaml')
+    paths = preparation['paths']
+    assert paths['dataset_backend'] == 'hf'
+    assert paths['hf_dataset_name'] == 'fastmachinelearning/collide-1m'
+    assert set(run['source']['processes'].values()) == {
+        str(Path(paths['dataset_dir']) / name) for name in paths['hf_data_dirs']
+    }
+    assert preparation['data'] == {'max_rows_per_process': 20, 'max_files': 1}
+    assert run['source']['max_events_per_class'] == 20
+    assert run['model']['name'] == 'foundation_tiny'

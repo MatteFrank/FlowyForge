@@ -9,7 +9,7 @@ model:
   output_dim: 64
 
 data:
-  # Exact {FullReco|L1T}_{collection}_{field} columns; never B1 summaries.
+  # Exact {FullReco|L1T}_{collection}_{field} nested columns.
   # Zero disables a collection. Features/dimensions derive from collection specs.
   collection_limits:
     PUPPIPart: 128

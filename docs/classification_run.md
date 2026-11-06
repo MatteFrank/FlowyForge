@@ -3,32 +3,29 @@
 Il punto di ingresso è `scripts/run_classification.py`, configurato da
 `configs/runs/classification.yaml`. Usa lo stesso modello strutturato della vertical
 slice nelle modalità `small` ed `eos`. Eseguire i comandi dalla radice del repository.
-Servono **Parquet originali con collections annidate**, non i riassunti scalari B1
-creati da `make_tiny_parquet_sample.py`, né gli array `X.npy` della baseline MLP.
-I comandi precedenti per B1 e per lo smoke test rimangono disponibili.
+Servono **Parquet originali con collections annidate**. Tutti i run usano
+ObjectTokenizer + Perceiver: la pipeline scalare e il vecchio trainer smoke sono
+stati rimossi. I dati e gli output storici non vengono cancellati.
 
-Non sono stati eseguiti training scientifici su EOS durante questa implementazione.
-L'accesso alla directory indicata restituisce `Operation not permitted` in questo
-ambiente: schema e unità reali devono essere confermati con il preflight da un nodo
-CERN autorizzato. Non confondere i test sintetici con una validazione di COLLIDE-V2.
+Schema/unità reali e prestazioni scientifiche su COLLIDE-V2 devono essere
+confermati sul sito. I test sintetici non sostituiscono questa validazione.
 
 ## Ambiente e configurazione
 
-Usare un ambiente con le dipendenze del progetto. Quello presente nel workspace è:
+Per creare la venv su macOS/Linux o Windows e per i comandi completi locali/HF,
+vedere il [README](../README.md). Dopo l'attivazione i comandi `python` sono uguali
+su tutti i sistemi. Su cluster caricare l'ambiente Python del sito prima di creare
+la venv e usare lo stesso ambiente nel batch job. Non copiare venv fra OS.
 
-```bash
-source /eos/home-m/matteo/venvs/venv_flowyforge/bin/activate
-python -m pip install -e .
-python -c "import torch; print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available())"
+```text
+python -m pip install -r requirements.txt
+python -m pip install --no-deps -e .
+python -m pip check
 ```
 
-Su un'altra macchina, creare un ambiente e installare il progetto:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
-```
+I comandi multilinea sotto usano la continuazione Bash `\`; su PowerShell o
+cmd eseguirli su una sola riga senza `\`. Il README fornisce già comandi su una
+riga. Percorsi e glob possono essere scritti con `/` e doppi apici anche su Windows.
 
 Per CUDA servono un nodo GPU e una build PyTorch compatibile con i driver.
 `--device auto` sceglie CUDA, poi MPS, poi CPU. `--device cuda:0` richiede la GPU:
@@ -42,7 +39,7 @@ relativi alla directory di lavoro. `--model-config` invece è relativo alla dire
 di lavoro. Per conservare configurazioni personali:
 
 ```bash
-cp configs/runs/classification.yaml configs/runs/classification_personal.yaml
+python -c "from shutil import copyfile; copyfile('configs/runs/classification.yaml', 'configs/runs/classification_personal.yaml')"
 ```
 
 Si possono salvare i percorsi piccoli sotto `sources.small.processes`, oppure
@@ -58,8 +55,8 @@ Ogni `--process NOME=PERCORSO` definisce una classe; racchiudere i glob tra apic
 python scripts/run_classification.py \
   --config configs/runs/classification.yaml \
   --mode small --stage inspect \
-  --process 'signal=/percorso/reale/signal/*.parquet' \
-  --process 'background=/percorso/reale/background/*.parquet' \
+  --process "signal=/percorso/reale/signal/*.parquet" \
+  --process "background=/percorso/reale/background/*.parquet" \
   --max-events-per-class 128 \
   --output-dir outputs/classification/small
 ```
@@ -72,8 +69,8 @@ e `preflight.json` secondo la checklist più sotto. Poi:
 python scripts/run_classification.py \
   --config configs/runs/classification.yaml \
   --mode small --stage train \
-  --process 'signal=/percorso/reale/signal/*.parquet' \
-  --process 'background=/percorso/reale/background/*.parquet' \
+  --process "signal=/percorso/reale/signal/*.parquet" \
+  --process "background=/percorso/reale/background/*.parquet" \
   --max-events-per-class 128 \
   --epochs 2 --batch-size 16 --device cpu \
   --output-dir outputs/classification/small
@@ -126,7 +123,7 @@ Controllare questi elementi prima di aumentare la scala:
 | Valori mancanti/non finiti | `fields`: liste null, valori non finiti e min/max **nelle unità originali**; `collections`: sostituzioni e campi opzionali assenti |
 | Troncamenti | Totali originali, conservati e scartati per collection; numero di eventi troncati |
 
-Il [contratto della vertical slice](foundation_smoke.md#data-contract) descrive
+Il [contratto delle collections](perceiver.md#data-contract) descrive
 nomi, feature, maschere e trasformazioni. Il default è `FullReco`; `--view L1T`
 richiede realmente le colonne `L1T_...` corrispondenti. Ogni collection abilitata
 deve avere un limite finito in `collection_limits`; zero la disabilita. Non
@@ -275,6 +272,8 @@ Le etichette sono quelle delle directory/mapping, non inferenze dalla fisica deg
 eventi. Gli split sono separati per riga sorgente; **non** si deduplicano eventi
 fisici replicati in file diversi. Prima di risultati scientifici definitivi,
 verificare identità degli eventi, eventuali correlazioni tra campagne e pesi fisici.
+Il manifest salva percorsi assoluti e fingerprint dei file: spostare i dati su
+un altro sistema richiede una gestione esplicita, non implementata dal runner.
 La riproducibilità riguarda input/configurazione invariati; non garantisce identità
 bit a bit tra device e versioni PyTorch. Un nuovo cap o inventario produce un nuovo
 manifest. Il runner usa un singolo device, senza DDP né resume.

@@ -191,8 +191,14 @@ def row_to_event_batch(
             indices = np.argsort(-np.maximum(clean["PT"], 0), kind="stable")
         indices = indices[:spec.max_objects]
         features: list[np.ndarray] = []
+        validity: list[np.ndarray] = []
         for field in spec.fields:
             values = clean[field][indices]
+            original = arrays.get(field)
+            valid = np.zeros(len(indices), dtype=bool) if original is None else np.isfinite(original[indices])
+            if field in {"PT", "MET", "Mass"} and original is not None:
+                valid &= original[indices] >= 0
+            validity.extend([valid] * (2 if field == "Phi" else 1))
             if field in {"PT", "MET", "Mass"}:
                 features.append(np.log1p(np.clip(values, 0, value_clip)))
             elif field == "Eta":
@@ -209,10 +215,12 @@ def row_to_event_batch(
             name=spec.name,
             features=tensor,
             mask=torch.ones((1, len(indices)), dtype=torch.bool),
+            feature_valid=torch.from_numpy(np.stack(validity, axis=-1)).unsqueeze(0),
             metadata={
                 "view": view, "feature_names": list(spec.feature_names),
                 "source_columns": list(columns.values()), "max_objects": spec.max_objects,
                 "original_count": count, "retained_count": len(indices),
+                "object_indices": indices.tolist(),
                 "truncated_count": count - len(indices), "nonfinite_values": nonfinite,
                 "missing_optional_fields": missing_optional,
             },
@@ -248,16 +256,28 @@ def collate_event_batches(events: Sequence[EventBatch]) -> EventBatch:
         length = max(group.features.shape[1] for group in present)
         features = first.features.new_zeros((len(events), length, first.features.shape[-1]))
         mask = torch.zeros((len(events), length), dtype=torch.bool, device=features.device)
+        indicators = {}
+        for attr in ("feature_valid", "feature_mask"):
+            supplied = [getattr(group, attr) is not None for group in present]
+            if any(supplied) and not all(supplied):
+                raise ValueError(f"{name}: cannot mix known and unknown {attr}.")
+            indicators[attr] = torch.zeros_like(features, dtype=torch.bool) if all(supplied) else None
         for index, event in enumerate(events):
             if name in event.objects:
                 group = event.objects[name]
                 size = group.features.shape[1]
                 features[index, :size] = group.features[0].masked_fill(~group.mask[0, :, None], 0)
                 mask[index, :size] = group.mask[0]
+                for attr, destination in indicators.items():
+                    if destination is not None:
+                        indicator = getattr(group, attr)
+                        if indicator.dtype != torch.bool or indicator.shape != group.features.shape:
+                            raise ValueError(f"{name}: {attr} must be boolean [1, N, F].")
+                        destination[index, :size] = indicator[0] & group.mask[0, :, None]
         objects[name] = ObjectGroup(name, features, mask, {
             "feature_names": first.metadata.get("feature_names"),
             "events": [event.objects[name].metadata if name in event.objects else None for event in events],
-        })
+        }, **indicators)
     labeled = [event.targets is not None for event in events]
     if any(labeled) and not all(labeled):
         raise ValueError("Cannot mix labeled and unlabeled events.")

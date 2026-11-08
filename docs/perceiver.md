@@ -3,8 +3,10 @@
 La rete attiva è `EventClassificationModel`, definita in
 `src/flowyforge/model_plugins/foundation_encoder.py`. Contiene un
 `FoundationEncoder` condiviso (`ObjectTokenizer` + `PerceiverEventEncoder`) e una
-testa supervisionata che predice il processo. I pesi vengono inizializzati e
-allenati insieme; non si carica un modello preaddestrato.
+testa supervisionata che predice il processo. Il runner di riferimento inizializza
+i pesi da zero. Il pretraining con masking usa lo stesso encoder e decoder per
+collection; `EventClassificationModel.from_encoder_checkpoint` ne carica i pesi
+con controllo rigoroso e aggiunge una testa nuova.
 
 ```text
 EventBatch: collections eterogenee [B, N_g, F_g] + masks [B, N_g]
@@ -88,7 +90,7 @@ vuoto dipende dai latenti appresi e non contiene informazione osservata.
 
 ## Training, test e report
 
-Il solo comando di training è `scripts/run_classification.py`. Un piccolo smoke
+Il comando di training supervisionato è `scripts/run_classification.py`. Un piccolo smoke
 è un run con pochi eventi/epoche dello stesso codice usato per il dataset intero.
 Il reader streaming mantiene batch e buffer limitati in memoria; i processi,
 campioni e split vengono congelati in `dataset_manifest.json`.
@@ -109,3 +111,27 @@ I test HF simulano lo stream remoto: nessun dataset esterno o accesso EOS.
 
 Per comandi e configurazione vedere il [README](../README.md) e la
 [guida ai run](classification_run.md).
+
+## Pretraining con masking
+
+`scripts/run_pretraining.py` riusa l'encoder e richiede le partizioni condivise.
+`FoundationEncoder.forward_features` calcola una sola tokenizzazione e restituisce
+embedding, `TokenBatch` con intervalli `group_slices`, metadati evento/oggetto.
+Gli indici `object_indices` conservano le posizioni prima di sort e troncamento.
+`encode` restituisce ancora soltanto l'embedding.
+
+Il reader aggiunge `feature_valid[B,N,F]` senza modificare i valori delle feature.
+Il masking produce un nuovo batch con `feature_mask[B,N,F]` e bersagli separati.
+Il tokenizer configurato con `mask_indicators=True` azzera i valori nascosti e
+aggiunge embedding apprendibili per feature. Questa opzione è disattivata nei
+modelli supervisionati precedenti: le loro chiavi di checkpoint restano valide.
+
+`MaskedReconstructionModel` concatena token corrotto ed embedding globale per
+oggetto e applica un decoder Linear/GELU/Linear specifico della collection.
+`MaskedModelingTask` calcola Huber solo sui bersagli nascosti validi, mediando per
+feature e collection. Il percorso globale riceve gradienti dalla ricostruzione.
+Il trainer salva lo stato completo per resume e un `encoder.pt` indipendente,
+scelto sulla validation. Nessuna lettura del test per loss o stime delle costanti.
+
+Configurazione, comandi CPU/CUDA/MPS, ripresa, contratto di caricamento e limiti
+sono documentati nel [README](../README.md#pretraining-con-masking-encoder-trasferibile-fullreco-e-l1t-separati).

@@ -1,0 +1,52 @@
+# Common FullReco/L1T protocol: select --view and a distinct --output-dir.
+# Reuses existing pilot partitions; never prepares/downloads data or evaluates test.
+mode: small
+model_config: ../models/foundation_tiny.yaml
+partition_manifest: data/processed/collide_pilot/partitions.json
+output_dir: outputs/perceiver/pretraining_fullreco
+seed: 42
+sources:
+  small:
+    processes:
+      tt0123j_5f_ckm_LO_MLM_semiLeptonic: data/processed/collide_pilot/tt0123j_5f_ckm_LO_MLM_semiLeptonic
+      WJetsToLNu_13TeV-madgraphMLM-pythia8: data/processed/collide_pilot/WJetsToLNu_13TeV-madgraphMLM-pythia8
+    max_events_per_class: null
+data:
+  view: FullReco
+  validation_fraction: 0.2
+  test_fraction: 0.2
+  units:
+    momentum: GeV
+    angle: rad
+  read_batch_size: 128
+  shuffle_buffer: 512
+  audit_events_per_class: 32
+training:
+  epochs: 3
+  batch_size: 16
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  gradient_clip_norm: 1.0
+  device: auto
+  num_workers: 0
+  cpu_threads: 4
+  log_every_batches: 100
+pretraining:
+  probability: 0.15
+  seed: 12345
+  huber_delta: 1.0
+  decoder_hidden_dim: 64
+  targets:
+    PUPPIPart:
+    - log1p_PT
+    JetPuppiAK4:
+    - log1p_PT
+    - log1p_Mass
+    Electron:
+    - log1p_PT
+    MuonTight:
+    - log1p_PT
+    PhotonTight:
+    - log1p_PT
+  collection_weights: {}
+  feature_weights: {}

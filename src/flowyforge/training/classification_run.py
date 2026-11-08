@@ -49,6 +49,12 @@ def load_run_config(path: str | Path, overrides: Mapping[str, Any] | None = None
     """Resolve YAML and explicit CLI overrides; reject misspelled settings."""
     path = Path(path).expanduser().resolve()
     raw = load_yaml(path)
+    return _resolve_run_config(raw, path, overrides)
+
+
+def _resolve_run_config(raw: Mapping[str, Any], path: Path,
+                        overrides: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Shared reader/model/optimizer configuration, also used by pretraining."""
     overrides = dict(overrides or {})
     _known(raw, {"mode", "model_config", "output_dir", "seed", "sources", "data", "training", "partition_manifest", "evaluation"}, "run")
     _known(overrides, {"mode", "processes", "data_root", "process_names", "max_events_per_class",
@@ -171,7 +177,9 @@ def batch_to_device(batch: EventBatch, device: torch.device) -> EventBatch:
     """Move features, masks and labels together, preserving CPU provenance."""
     return EventBatch(
         objects={name: ObjectGroup(name, group.features.to(device),
-                                   None if group.mask is None else group.mask.to(device), group.metadata)
+                                   None if group.mask is None else group.mask.to(device), group.metadata,
+                                   None if group.feature_valid is None else group.feature_valid.to(device),
+                                   None if group.feature_mask is None else group.feature_mask.to(device))
                  for name, group in batch.objects.items()},
         targets=None if batch.targets is None else batch.targets.to(device), metadata=batch.metadata,
     )
@@ -347,9 +355,10 @@ def _init_worker(worker_id: int) -> None:
                         raise
 
 
-def _loader(manifest: dict[str, Any], config: dict[str, Any], split: str) -> DataLoader:
+def _loader(manifest: dict[str, Any], config: dict[str, Any], split: str,
+            *, purpose: str = "downstream") -> DataLoader:
     dataset = StreamingDataset(manifest, split, shuffle_buffer=config["data"]["shuffle_buffer"],
-                               **_reader_settings(config))
+                               purpose=purpose, **_reader_settings(config))
     workers = config["training"]["num_workers"]
     # Spawn avoids inheriting a CUDA context. Each epoch gets the updated epoch
     # seed; worker sharding belongs to the iterable dataset, not a sampler.

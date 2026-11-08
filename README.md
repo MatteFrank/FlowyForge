@@ -3,8 +3,10 @@
 FlowyForge mantiene una sola pipeline di classificazione: **oggetti COLLIDE →
 ObjectTokenizer → Perceiver → embedding dell'evento → classification head**.
 Lo stesso runner legge piccoli campioni e dataset completi in streaming, allena
-su CPU/CUDA/MPS e produce valutazione e report. Il training è supervisionato da
-etichette di processo; non è ancora un foundation model preaddestrato.
+su CPU/CUDA/MPS e produce valutazione e report. Il riferimento supervisionato usa
+etichette di processo. Un secondo entrypoint esegue il pretraining con masking
+dello stesso encoder ed esporta i pesi trasferibili; le prestazioni scientifiche
+del pretraining e del transfer non sono ancora validate.
 
 La baseline B1/MLP, la vettorizzazione scalare, il preprocessing `.npy`, il vecchio
 runner HF B1 e il trainer foundation smoke duplicato sono stati rimossi. I dati e
@@ -472,8 +474,8 @@ distribuito per l'intero dataset. Gli oggetti trasformati restano in streaming.
 
 ### Accesso per pretraining e selezione del checkpoint
 
-È implementata l'API di accesso alle partizioni; non è introdotto un trainer di
-pretraining o una nuova loss. Esempio Python eseguibile dopo la creazione:
+L'API di accesso alle partizioni è riusata dal trainer con masking descritto
+nella sezione successiva. Esempio Python eseguibile dopo la creazione:
 
 ```python
 from flowyforge.training.classification_run import load_run_config
@@ -622,7 +624,7 @@ Si possono cambiare device, batch size o numero di worker di **valutazione**;
 il protocollo di training originale resta registrato. Per dati spostati aggiungere
 `--data-root NUOVA_RADICE` secondo la procedura del passo 2. Le directory con score
 esistenti non vengono sovrascritte: per un'altra valutazione scegliere un nuovo
-`--output-dir`. Non è implementato il resume del training.
+`--output-dir`. Il runner supervisionato non implementa il resume del training.
 
 ### Score, ROC-AUC ed efficienza del segnale
 
@@ -719,6 +721,278 @@ etichette di fixture sintetiche: quelle metriche non misurano prestazioni
 fisiche. **Il training sul pilot reale non è stato avviato**, né sono stati
 eseguiti training su GPU o EOS in questo passo.
 
+## Pretraining con masking: encoder trasferibile, FullReco e L1T separati
+
+Il passo 4 aggiunge **`scripts/run_pretraining.py`**, che riusa reader, partizioni,
+collation, device e `FoundationEncoder` del classificatore. Non scarica dati,
+non ricampiona gli eventi e non esegue il training supervisionato. I comandi
+precedenti restano funzionanti. Non sono implementati allineamento fra viste,
+batch accoppiati o un confronto scientifico fine-tuning/linear probe.
+
+```text
+partitions.json + Parquet nested → solo split train / validation
+  → trasformazioni del reader + validità originale per feature
+  → masking → ObjectTokenizer (una volta) → Perceiver → embedding evento
+             └─ token corrotto dell'oggetto + embedding evento
+                  → piccolo decoder della collection → feature ricostruite
+  → Huber sui soli bersagli nascosti → checkpoint.pt + encoder.pt
+```
+
+### Preparazione, configurazione e ispezione
+
+Completare la preparazione del pilot e la creazione delle partizioni documentate
+sopra. I file attesi sono i Parquet nested dei due processi e
+`data/processed/collide_pilot/partitions.json`. Gli stessi eventi e split usati dal
+riferimento supervisionato vanno mantenuti: **non rigenerare le partizioni** per
+una vista o per il pretraining. Il pilot HF rimane un campione da file selezionati,
+non un campione uniforme dell'intero repository.
+
+La configurazione comune **`configs/runs/collide_pretraining.yaml`** rende
+eseguibili entrambe le viste: cambiare `--view` e `--output-dir` nei comandi sotto.
+Ogni run salva il proprio `resolved_config.yaml`. Sono mantenuti architettura,
+feature, trasformazioni e limiti di `configs/models/foundation_tiny.yaml`; i
+parametri aggiunti sono gli indicatori di masking e i decoder. Default: seed
+modello/ordine 42, 3 epoche, batch 16, AdamW con learning rate 0.001. Questi sono
+parametri iniziali, non un protocollo scientifico già ottimizzato.
+
+Dalla radice del repository, con venv attiva su macOS/Linux/Windows/HPC:
+
+```text
+python scripts/run_pretraining.py --config configs/runs/collide_pretraining.yaml --stage inspect --view FullReco --output-dir outputs/perceiver/pretraining_fullreco
+python scripts/run_pretraining.py --config configs/runs/collide_pretraining.yaml --stage inspect --view L1T --output-dir outputs/perceiver/pretraining_l1t
+```
+
+`inspect` verifica il binding del manifest e gli schemi, percorre il training per
+stimare le costanti di riferimento e la validation per contare i bersagli
+mascherati e calcolare la loss delle costanti. Non aggiorna pesi e non esporta
+checkpoint. Questa ispezione legge tutti gli eventi train/validation selezionati,
+quindi non è necessariamente rapida su EOS. `train` può partire senza un precedente
+`inspect` e riutilizzarne la directory finché non contiene artefatti di training.
+
+Per file locali/EOS già leggibili configurare `sources.small.processes` con
+mapping espliciti, oppure usare `--mode eos --data-root /percorso/montato`
+e `--process-name NOME` ripetuto. Sono supportati anche `--process "NOME=PATH"`,
+`--partition-manifest PATH` e `--max-events-per-class N`. I processi e il cap devono
+essere compatibili con le partizioni esistenti; il cap non seleziona nuovamente
+gli eventi. Identità e contenuti devono coincidere anche dopo una rilocazione.
+Il runner non monta EOS, non usa `root://` e non invia job allo scheduler.
+
+### Cosa viene nascosto e come si calcola la loss
+
+| Opzione YAML `pretraining` | Default e significato |
+| --- | --- |
+| `probability` | `0.15`, probabilità indipendente per bersaglio idoneo, nell'intervallo `(0,1]` |
+| `seed` | `12345`, seed delle maschere, distinto dal `seed` principale |
+| `targets` | `log1p_PT` in PUPPIPart, JetPuppiAK4, Electron, MuonTight, PhotonTight; anche `log1p_Mass` in JetPuppiAK4 |
+| `huber_delta` | `1.0`, soglia della Huber nelle unità delle feature trasformate |
+| `decoder_hidden_dim` | `64`, larghezza del decoder `Linear → GELU → Linear` per collection |
+| `collection_weights` | `{}`, peso 1 per collection; chiavi come `JetPuppiAK4` |
+| `feature_weights` | `{}`, peso 1 per feature; chiavi come `JetPuppiAK4/log1p_Mass` |
+
+`targets: null` seleziona automaticamente PT e massa jet nelle collections
+abilitate; il file distribuito li elenca esplicitamente. Si può restringere
+l'elenco, ma questo passo rifiuta nuovi tipi di bersaglio. Se si disabilita una
+collection nel modello, rimuoverla anche da `targets` oppure usare `null`.
+PUPPIMET e le feature non elencate rimangono visibili. Non vengono aggiunte
+collections o nuove feature fisiche.
+
+I pesi devono essere positivi e finiti. Esempio:
+
+```yaml
+pretraining:
+  probability: 0.15
+  seed: 12345
+  huber_delta: 1.0
+  decoder_hidden_dim: 64
+  targets: null
+  collection_weights: {PUPPIPart: 1.0, JetPuppiAK4: 2.0}
+  feature_weights: {JetPuppiAK4/log1p_Mass: 2.0}
+```
+
+Il reader conserva `feature_valid[B,N,F]`: un bersaglio è idoneo solo se presente,
+finito e, per PT/Mass, non negativo prima delle trasformazioni. Valori opzionali
+mancanti, nulli, NaN/inf e valori negativi portati a zero sono esclusi. Un vero
+zero è valido. I valori superiori a `value_clip` restano bersagli validi dopo il
+clipping già previsto dal reader. Ordinamento, troncamento e padding preservano
+la validità e gli indici originali degli oggetti.
+
+La preparazione crea un nuovo batch senza modificare l'originale. Il valore
+nascosto diventa zero e `feature_mask[B,N,F]` attiva un embedding apprendibile
+specifico per collection/feature. È distinto da un vero zero; il padding ha
+maschera oggetto falsa, indicatori falsi e token zero. Gli indicatori passano
+attraverso collation e trasferimento al device. Il decoder riceve soltanto il
+token corrotto e l'embedding globale, mai i valori originali dei bersagli.
+Le etichette di processo non entrano nella loss.
+
+La Huber viene mediata prima sugli oggetti mascherati di ciascuna feature, poi
+fra le feature della collection, infine fra le collections, normalizzando i pesi
+in ciascuno dei due livelli. Le feature senza bersagli nel batch sono escluse
+dalle medie. Gli eventi vuoti non contribuiscono alla loss; un batch senza
+bersagli nascosti salta backward e optimizer, incluso il weight decay. Un'intera
+epoca senza bersagli, oppure una validation senza bersagli, causa un errore
+esplicito: aumentare il campione o la probabilità. Non viene forzato un bersaglio
+per ogni evento.
+
+Le maschere di training dipendono da identità evento, seed, collection ed epoca.
+Quelle di validation usano un dominio di seed distinto e rimangono fisse:
+ordine dei batch, padding ed epoca non cambiano la maschera di un evento. La
+valutazione aggrega somme e conteggi per feature sull'intero split, evitando di
+pesare diversamente i batch incompleti.
+
+### Eseguire i due training e leggere il confronto con la costante
+
+I seguenti comandi avviano il pilot **solo quando eseguiti dall'utente**:
+
+```text
+python scripts/run_pretraining.py --config configs/runs/collide_pretraining.yaml --stage train --view FullReco --output-dir outputs/perceiver/pretraining_fullreco
+python scripts/run_pretraining.py --config configs/runs/collide_pretraining.yaml --stage train --view L1T --output-dir outputs/perceiver/pretraining_l1t
+```
+
+Per CPU aggiungere `--device cpu`; per un nodo CUDA già allocato `--device cuda:0`.
+`--epochs`, `--batch-size`, `--num-workers`, `--seed` e `--model-config` sovrascrivono
+le opzioni corrispondenti. Learning rate, clipping, weight decay, thread CPU,
+limiti degli oggetti e opzioni del masking si configurano nello YAML. Iniziare
+con `--num-workers 0`; gli oggetti sono letti e ricostruiti un batch alla volta.
+
+Il training usa esclusivamente `purpose="pretraining"` sullo split train; la
+validation usa `purpose="checkpoint_selection"`. Non viene costruito un loader
+per il test, né calcolata una sua loss. Le verifiche di integrità leggono i file
+sorgenti e i manifest possono contenere le appartenenze test: ciò non usa quegli
+eventi per ottimizzazione, costanti o selezione del checkpoint.
+
+`metrics.json` e `history.json` riportano Huber, conteggi mascherati per feature,
+eventi vuoti, batch saltati e passi dell'optimizer. La minima loss di validation
+seleziona l'encoder. `validation.training_constant` valuta, sugli **stessi bersagli
+mascherati**, una predizione costante per feature: la media aritmetica delle
+feature trasformate valide stimata **soltanto sul train**, prima del training.
+`constant_baseline` salva stime e conteggi; non si conservano gli oggetti di tutti
+gli eventi in memoria. Se manca una stima train per un bersaglio incontrato in
+validation, il run segnala l'incompatibilità invece di stimarla dalla validation.
+
+`improvement_over_constant = loss_costante - loss_modello`: positivo significa
+loss inferiore alla costante. La media è un riferimento semplice, non il miglior
+estimatore costante possibile per una Huber. Un piccolo smoke può restare peggiore
+della costante: non è un risultato scientifico di transfer. Non viene valutato
+il test downstream e non viene generato un report ROC per questo task.
+
+### Checkpoint, ripresa e caricamento nel classificatore
+
+Ogni directory contiene:
+
+- `checkpoint.pt`: stato dell'ultima epoca completata, encoder e decoder,
+  optimizer, RNG, generatori dei loader, epoca, history, migliore encoder,
+  configurazione, contratto e fingerprint dei manifest;
+- `encoder.pt`: **solo tokenizer e Perceiver della migliore epoca di validation**,
+  insieme a contratto e provenienza; nessun decoder o classification head;
+- `resolved_config.yaml`, `partitions.json`, `dataset_manifest.json`,
+  `preflight.json`, `history.json`, `metrics.json`.
+
+I due checkpoint trasferibili sono
+`outputs/perceiver/pretraining_fullreco/encoder.pt` e
+`outputs/perceiver/pretraining_l1t/encoder.pt`: sono encoder distinti, ciascuno
+addestrato su una vista. I checkpoint hanno tipo e versione espliciti (`1`).
+Registrano architettura, ordine/significato delle feature, trasformazioni,
+collections, limiti, unità, vista e riferimenti/hash dei manifest.
+
+Una directory già allenata è protetta da sovrascritture. Per riprendere
+**dall'ultima epoca completata**, specificare il suo `checkpoint.pt` e la stessa
+directory/configurazione. `--epochs` è il numero totale, non le epoche aggiuntive:
+
+```text
+python scripts/run_pretraining.py --config configs/runs/collide_pretraining.yaml --view FullReco --output-dir outputs/perceiver/pretraining_fullreco --resume outputs/perceiver/pretraining_fullreco/checkpoint.pt --epochs 6
+python scripts/run_pretraining.py --config configs/runs/collide_pretraining.yaml --view L1T --output-dir outputs/perceiver/pretraining_l1t --resume outputs/perceiver/pretraining_l1t/checkpoint.pt --epochs 6
+```
+
+La ripresa ammette solo variazioni di orizzonte epoche e device; non permette
+cambi di batch size, maschere, reader, partizioni o dati. Non riprende a metà
+batch/epoca. La riproducibilità esatta è verificata su CPU nello stesso ambiente;
+cambiare hardware o versioni delle librerie non garantisce gli stessi bit.
+La rilocazione dei dati può essere verificata per un nuovo binding/run, ma la
+ripresa richiede lo stesso binding salvato. L'export `encoder.pt` è caricabile
+indipendentemente dalla posizione dei Parquet.
+
+Esempio Python di trasferimento con testa nuova, senza avviare fine-tuning:
+
+```python
+from flowyforge.model_plugins.foundation_encoder import (
+    EventClassificationModel, encoder_contract, load_encoder,
+)
+from flowyforge.training.pretraining_run import load_pretraining_config
+
+config = load_pretraining_config("configs/runs/collide_pretraining.yaml", {"view": "FullReco"})
+expected = encoder_contract(config["model"], config["data"])
+encoder = load_encoder("outputs/perceiver/pretraining_fullreco/encoder.pt", expected_contract=expected).eval()
+classifier = EventClassificationModel.from_encoder_checkpoint(
+    "outputs/perceiver/pretraining_fullreco/encoder.pt", num_classes=2,
+    expected_contract=expected,
+).eval()
+# Con un EventBatch prodotto dal reader configurato allo stesso modo:
+# embedding = encoder.encode(batch)
+# logits = classifier(batch)
+```
+
+`load_encoder` ricostruisce l'architettura dal contratto e usa `strict=True` per
+chiavi e dimensioni dei pesi. Passare `expected_contract` controlla anche il
+contratto desiderato dal downstream, inclusa la vista: non basta che le dimensioni
+coincidano. `forward_features(batch)` restituisce embedding, token, intervalli
+per collection e metadati evento/oggetto, tokenizzando una sola volta. Gli indici
+`object_indices` nei metadati risalgono alle posizioni originali prima di sort e
+troncamento. `encode(batch)` conserva l'interfaccia precedente.
+
+Il runner supervisionato continua a inizializzare da zero per preservare il
+riferimento del passo 3. Non è stata aggiunta un'opzione che trasformi di nascosto
+quel riferimento in fine-tuning; qui sono disponibili export, caricamento e test
+di forward con una testa nuova.
+
+### Smoke offline riproducibile
+
+Per provare il percorso senza HF/EOS, preparare 20 eventi sintetici per processo
+e un manifest separato. Queste directory devono essere nuove; in caso contrario
+scegliere altri nomi:
+
+```text
+python scripts/make_tiny_parquet_sample.py --output-dir data/samples/pretraining_tiny --events-per-class 20 --files-per-class 1
+python scripts/run_classification.py --config configs/runs/local.yaml --stage partitions --process background=data/samples/pretraining_tiny/background --process signal=data/samples/pretraining_tiny/signal --max-events-per-class 20 --partition-manifest data/samples/pretraining_tiny/partitions.json
+python scripts/run_pretraining.py --config configs/runs/collide_pretraining.yaml --process background=data/samples/pretraining_tiny/background --process signal=data/samples/pretraining_tiny/signal --max-events-per-class 20 --partition-manifest data/samples/pretraining_tiny/partitions.json --view FullReco --epochs 1 --batch-size 8 --device cpu --output-dir outputs/perceiver/pretraining_tiny_fullreco
+python scripts/run_pretraining.py --config configs/runs/collide_pretraining.yaml --process background=data/samples/pretraining_tiny/background --process signal=data/samples/pretraining_tiny/signal --max-events-per-class 20 --partition-manifest data/samples/pretraining_tiny/partitions.json --view L1T --epochs 1 --batch-size 8 --device cpu --output-dir outputs/perceiver/pretraining_tiny_l1t
+python -m pytest tests/test_masked_pretraining.py -q
+python -m pytest tests/ -q
+```
+
+Verifiche effettivamente eseguite il **7 novembre 2026**: suite `pytest tests/`
+con **92 test passati**, inclusi gli 8 test mirati in
+`test_masked_pretraining.py`, su CPU. I test coprono validità
+originale, padding, assenza di passaggio dei valori nascosti al decoder, singola
+tokenizzazione, gradienti finiti verso tokenizer/Perceiver/decoder, maschere
+validation riproducibili, trasferimento rigoroso e uguaglianza degli embedding
+in eval. Il resume CPU coincide esattamente con un run continuo di due epoche.
+
+Eseguiti inoltre due smoke CLI con **40 eventi sintetici**, stessi split
+24 train / 8 validation / 8 test: una prima epoca per vista, più una seconda epoca
+FullReco tramite resume. Il test è rimasto escluso. Gli artefatti locali sono in
+`outputs/perceiver/pretraining_smoke/`: `config.yaml`, partizioni, directory
+`fullreco/`, `l1t/` e `transfer_smoke.json`. Entrambi gli export producono embedding
+identici a quelli selezionati in memoria e un forward finito con testa nuova.
+
+| Smoke | Epoca selezionata | Huber validation | Costante da train |
+| --- | ---: | ---: | ---: |
+| FullReco | 2 | 0.834226 | 0.572626 |
+| L1T | 1 | 2.139672 | 0.578392 |
+
+Questi valori mostrano un controllo tecnico, con epoche diverse; entrambi i
+modelli sono ancora peggiori della costante. Non è un confronto scientifico
+tra viste o una misura di transfer. **Nessun pretraining sul pilot reale, su GPU
+o su EOS è stato avviato.**
+
+Per ripetere l'ispezione o continuare gli smoke già presenti, senza sovrascrivere
+checkpoint, usare nuove directory per l'ispezione e un orizzonte più lungo per
+il resume; ad esempio:
+
+```text
+python scripts/run_pretraining.py --config outputs/perceiver/pretraining_smoke/config.yaml --stage inspect --view FullReco --output-dir outputs/perceiver/pretraining_smoke/inspect_fullreco
+python scripts/run_pretraining.py --config outputs/perceiver/pretraining_smoke/config.yaml --view FullReco --output-dir outputs/perceiver/pretraining_smoke/fullreco --resume outputs/perceiver/pretraining_smoke/fullreco/checkpoint.pt --epochs 3
+```
+
 ## EOS/LXPLUS o altro filesystem HPC
 
 Su un nodo autorizzato dove i Parquet sono leggibili come file locali, controllare
@@ -759,7 +1033,7 @@ La suite locale valida il percorso CPU; la disponibilità si può controllare co
 python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('MPS:', torch.backends.mps.is_available())"
 ```
 
-Ogni training salva `resolved_config.yaml`, `dataset_manifest.json`,
+Ogni training supervisionato salva `resolved_config.yaml`, `dataset_manifest.json`,
 `preflight.json`, `checkpoint.pt`, `history.json`, `metrics.json`, `report.html`,
 `tables/` e `plots/` (CSV, PNG/PDF). Aprire `report.html` con un browser; il report
 non richiede un server. Conservare i file del run insieme e mantenere accessibili
@@ -767,7 +1041,8 @@ i Parquet per `evaluate`. I run con partizioni condivise salvano anche
 `partitions.json` e permettono la rilocazione verificata tramite `--data-root`;
 i manifest legacy versione 1 conservano i percorsi originali.
 
-Il checkpoint è per inferenza/valutazione, senza resume del training. Training su
+Il checkpoint supervisionato è per inferenza/valutazione, senza resume; il
+pretraining ha un checkpoint riprendibile separato, come descritto sopra. Training su
 un singolo device, niente DDP o pesi fisici; split per riga, senza deduplicazione
 di eventi fisici tra file. Accuracy/F1 su campioni piccoli non sono un benchmark.
 Schema, unità e prestazioni reali COLLIDE-V2 richiedono una validazione sul sito.

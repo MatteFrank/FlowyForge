@@ -327,3 +327,9 @@ python -m pytest -q tests/test_streaming_collide.py tests/test_classification_ru
 
 Prima di un eventuale commit, le istruzioni del repository richiedono anche
 `python -m pytest tests/`. Non aggiungere dataset, checkpoint o output pesanti al Git.
+
+Il pretraining con masking ha un entrypoint separato, `scripts/run_pretraining.py`,
+che riusa le partizioni e l'encoder senza cambiare questo riferimento supervisionato.
+Il suo checkpoint completo supporta resume; `encoder.pt` supporta caricamento
+rigoroso nel classificatore con testa nuova. Procedura e limitazioni nel
+[README](../README.md#pretraining-con-masking-encoder-trasferibile-fullreco-e-l1t-separati).

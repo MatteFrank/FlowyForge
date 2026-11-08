@@ -14,6 +14,10 @@ class ObjectGroup:
     features: Any
     mask: Any | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # [B, N, F], True = originally present/finite (and in transform domain).
+    feature_valid: Any | None = None
+    # [B, N, F], True = deliberately hidden for reconstruction; not padding.
+    feature_mask: Any | None = None
 
 
 @dataclass(slots=True)

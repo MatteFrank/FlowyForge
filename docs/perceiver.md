@@ -135,3 +135,24 @@ scelto sulla validation. Nessuna lettura del test per loss o stime delle costant
 
 Configurazione, comandi CPU/CUDA/MPS, ripresa, contratto di caricamento e limiti
 sono documentati nel [README](../README.md#pretraining-con-masking-encoder-trasferibile-fullreco-e-l1t-separati).
+
+## Testa downstream e freezing
+
+Il costruttore `EventClassificationModel(encoder, num_classes, head_type="mlp",
+freeze_encoder=False)` mantiene i default precedenti. La factory
+`from_encoder_checkpoint` accetta le stesse opzioni e il contratto atteso.
+Nel benchmark il runner imposta sempre `head_type="linear"`: un solo
+`nn.Linear(output_dim, num_classes)`, anche per scratch e fine-tuning.
+Il diagramma iniziale descrive la testa legacy; per il benchmark l'ultimo blocco
+è semplicemente `Linear(64, C)`.
+
+Nel linear probe `freeze_encoder=True` disattiva i gradienti di tutti i parametri
+dell'encoder. L'override di `train()` mantiene i suoi moduli in eval, inclusi i
+dropout; `encode()` usa `torch.no_grad()`. La testa resta allenabile. In fine-tuning
+il normale stato train/eval e il flusso dei gradienti sono ripristinati dall'istanza
+non congelata. Si tratta di run distinti, senza mutazioni di un run precedente.
+
+Il caricamento aggiunge al modello metadati di provenienza e SHA256 dell'export,
+senza nuove feature fisiche o cambiamenti nell'algoritmo di attenzione. La
+procedura e il confronto sono nel
+[README](../README.md#downstream-transfer-scratch-linear-probe-e-fine-tuning).

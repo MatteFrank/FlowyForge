@@ -33,6 +33,7 @@ from flowyforge.data_plugins.collide_v2.streaming import (
     StreamingDataset, bind_partition_manifest, build_manifest, inspect_dataset, load_partition_manifest,
 )
 from flowyforge.model_plugins import EventClassificationModel, FoundationEncoder, PerceiverConfig
+from flowyforge.model_plugins.foundation_encoder import encoder_contract
 
 
 def _known(mapping: Mapping[str, Any], allowed: set[str], section: str) -> None:
@@ -56,10 +57,10 @@ def _resolve_run_config(raw: Mapping[str, Any], path: Path,
                         overrides: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Shared reader/model/optimizer configuration, also used by pretraining."""
     overrides = dict(overrides or {})
-    _known(raw, {"mode", "model_config", "output_dir", "seed", "sources", "data", "training", "partition_manifest", "evaluation"}, "run")
+    _known(raw, {"mode", "model_config", "output_dir", "seed", "sources", "data", "training", "partition_manifest", "evaluation", "downstream"}, "run")
     _known(overrides, {"mode", "processes", "data_root", "process_names", "max_events_per_class",
                        "view", "device", "epochs", "batch_size", "num_workers", "seed",
-                       "output_dir", "model_config", "partition_manifest"}, "override")
+                       "output_dir", "model_config", "partition_manifest", "downstream_mode", "encoder_checkpoint"}, "override")
     mode = overrides.get("mode", raw.get("mode", "small"))
     if mode not in {"small", "eos"}:
         raise ValueError("mode must be small or eos.")
@@ -150,7 +151,27 @@ def _resolve_run_config(raw: Mapping[str, Any], path: Path,
         _positive_integer(evaluation[key], "evaluation." + key)
     if signal is not None and partition_path is None:
         raise ValueError("Binary evaluation requires partition_manifest for stable event identities.")
+    downstream = None
+    if "downstream" in raw or any(k in overrides for k in ("downstream_mode", "encoder_checkpoint")):
+        downstream = {"mode": "scratch", "encoder_checkpoint": None, **raw.get("downstream", {})}
+        _known(downstream, {"mode", "encoder_checkpoint"}, "downstream")
+        for source_key, key in (("downstream_mode", "mode"), ("encoder_checkpoint", "encoder_checkpoint")):
+            if source_key in overrides:
+                downstream[key] = overrides[source_key]
+        if downstream["mode"] not in {"scratch", "linear_probe", "finetune"}:
+            raise ValueError("downstream.mode must be scratch, linear_probe or finetune.")
+        checkpoint = downstream["encoder_checkpoint"]
+        if downstream["mode"] == "scratch":
+            if checkpoint is not None:
+                raise ValueError("scratch must not specify an encoder_checkpoint.")
+        elif not isinstance(checkpoint, (str, Path)) or not str(checkpoint).strip():
+            raise ValueError("linear_probe/finetune requires encoder_checkpoint (an exported encoder.pt).")
+        else:
+            downstream["encoder_checkpoint"] = str(Path(checkpoint).expanduser())
+        if partition_path is None or signal is None:
+            raise ValueError("Downstream benchmarking requires shared partition_manifest and evaluation.signal_process.")
     return {"mode": mode, "source": source, "model": model, "data": data, "training": training,
+            **({"downstream": downstream} if downstream is not None else {}),
             "partition_manifest": partition_path, "evaluation": evaluation,
             "seed": seed, "output_dir": str(Path(overrides.get("output_dir", raw.get("output_dir", "outputs/classification"))).expanduser()),
             "config_path": str(path), "model_config_path": str(model_path.resolve())}
@@ -195,10 +216,47 @@ def _manifest_digest(manifest: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(manifest, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
-def _make_model(config: dict[str, Any], label_map: dict[str, int]) -> EventClassificationModel:
+def _make_model(config: dict[str, Any], label_map: dict[str, int], *, initialize_encoder=True) -> EventClassificationModel:
     parameters = {key: value for key, value in config["model"].items() if key != "name"}
     dims = collection_feature_dims(default_collection_specs(config["data"]["collection_limits"]))
-    return EventClassificationModel(FoundationEncoder(dims, PerceiverConfig(**parameters)), len(label_map))
+    downstream = config.get("downstream")
+    if downstream is None:
+        return EventClassificationModel(FoundationEncoder(dims, PerceiverConfig(**parameters)), len(label_map))
+    if downstream["mode"] not in {"scratch", "linear_probe", "finetune"}:
+        raise ValueError("Unsupported downstream mode in model configuration.")
+    frozen = downstream["mode"] == "linear_probe"
+    if initialize_encoder and downstream["mode"] != "scratch":
+        return EventClassificationModel.from_encoder_checkpoint(
+            downstream["encoder_checkpoint"], len(label_map), expected_contract=encoder_contract(config["model"], config["data"]),
+            head_type="linear", freeze_encoder=frozen)
+    # Evaluation restores the complete classifier: the original encoder.pt is not needed.
+    return EventClassificationModel(FoundationEncoder(dims, PerceiverConfig(**parameters), mask_indicators=True),
+                                    len(label_map), head_type="linear", freeze_encoder=frozen)
+
+
+def _downstream_metadata(model, config, manifest):
+    settings = config["downstream"]
+    source = None
+    if settings["mode"] != "scratch":
+        provenance = model.encoder.checkpoint_provenance
+        if (provenance.get("partition_sha256") != manifest.get("partition_sha256")
+            or provenance.get("pretraining_split") != "train" or provenance.get("checkpoint_selection_split") != "validation"
+            or provenance.get("test_used") is not False):
+            raise ValueError("Encoder provenance must match downstream partitions, train-only pretraining and validation selection; test must be excluded.")
+        source = {"path": str(Path(settings["encoder_checkpoint"]).resolve()),
+                  "sha256": model.encoder.checkpoint_sha256, "provenance": provenance}
+    return {"version": 1, "mode": settings["mode"], "head_type": "linear",
+            "freezing": "encoder_frozen_eval" if model.freeze_encoder else "none",
+            "encoder_source": source, "initial_encoder_sha256": _initial_state_digest(model.encoder),
+            "initial_head_sha256": _initial_state_digest(model.head),
+            "parameters": _parameter_counts(model)}
+
+
+def _parameter_counts(model):
+    return {"total": sum(p.numel() for p in model.parameters()),
+            "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            "encoder_trainable": sum(p.numel() for p in model.encoder.parameters() if p.requires_grad),
+            "head_trainable": sum(p.numel() for p in model.head.parameters() if p.requires_grad)}
 
 
 def _update_diagnostics(diagnostics: dict[str, Any], batch: EventBatch) -> None:
@@ -269,7 +327,18 @@ def _run_epoch(model: EventClassificationModel, loader: DataLoader, device: torc
         raise ValueError(f"Empty {description} split. Increase the sample or adjust split fractions.")
     result = compute_confusion_metrics(confusion.cpu().tolist(), label_map)
     result.update(loss=loss_sum / count, duration_seconds=time.monotonic() - started)
+    result["events_per_second"] = count / max(result["duration_seconds"], 1e-9)
     return result
+
+
+def _performance(history):
+    duration = sum(item.get("train_duration_seconds", 0) for item in history)
+    events = sum(item["train_num_events"] for item in history)
+    return {"train_duration_seconds": duration, "train_events": events,
+            "train_events_per_second": events / duration if duration else None,
+            "selection_validation_seconds": sum(item["validation"]["duration_seconds"] for item in history),
+            "epoch_duration_seconds": sum(item["duration_seconds"] for item in history),
+            "scope": "epoch train timing includes I/O and optimization; excludes preflight, final evaluation and reports"}
 
 
 def _training_protocol(config):
@@ -437,6 +506,9 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
                                   validation_fraction=config["data"]["validation_fraction"],
                                   test_fraction=config["data"]["test_fraction"], **reader)
     _binary_settings(config, manifest)
+    if inspect_only and config.get("downstream"):
+        # Also fail inspect for incompatible encoder weights/contracts/provenance.
+        _downstream_metadata(_make_model(config, manifest["label_map"]), config, manifest)
     preflight = inspect_dataset(manifest, audit_events_per_class=config["data"]["audit_events_per_class"],
                                 **_reader_settings(config))
     _write_json(output / "dataset_manifest.json", manifest)
@@ -455,7 +527,8 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
     model = _make_model(config, manifest["label_map"]).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
+                                  lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
     loaders = {name: _loader(manifest, config, name) for name in ("train", "validation", "test")}
     history, best_loss, best_epoch = [], math.inf, 0
     diagnostics: dict[str, Any] = {"scope": "all selected rows once: first train epoch, final validation and test"}
@@ -463,6 +536,11 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
     metrics = _base_metrics(config, manifest, preflight, device)
     metrics.update(initialization="random_from_scratch", initial_state_sha256=_initial_state_digest(model),
                    training_protocol=_training_protocol(config))
+    if config.get("downstream"):
+        metrics["downstream"] = _downstream_metadata(model, config, manifest)
+        metrics["input_contract"] = encoder_contract(config["model"], config["data"])
+        if config["downstream"]["mode"] != "scratch":
+            metrics["initialization"] = "pretrained_encoder_new_head"
     for epoch in range(1, settings["epochs"] + 1):
         started = time.monotonic()
         loaders["train"].dataset.set_epoch(epoch)
@@ -474,7 +552,8 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
         validation = _run_epoch(model, loaders["validation"], device, manifest["label_map"],
                                 log_every_batches=settings["log_every_batches"], description=f"epoch {epoch} validation")
         history.append({"epoch": epoch, "train_loss": train["loss"], "train_accuracy": train["accuracy"],
-                        "train_num_events": train["num_events"], "validation": validation,
+                        "train_num_events": train["num_events"], "train_duration_seconds": train["duration_seconds"],
+                        "train_events_per_second": train["events_per_second"], "validation": validation,
                         "duration_seconds": time.monotonic() - started})
         _write_json(output / "history.json", history)
         print(f"Epoch {epoch}/{settings['epochs']}: train loss={train['loss']:.5f}, "
@@ -482,8 +561,14 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
               f"macro F1={validation['macro_f1']:.4f}", flush=True)
         if validation["loss"] < best_loss:
             best_loss, best_epoch = validation["loss"], epoch
+            if config.get("downstream"):
+                metrics["downstream"]["selected_encoder_sha256"] = _initial_state_digest(model.encoder)
+                metrics["downstream"]["selected_head_sha256"] = _initial_state_digest(model.head)
             temporary = output / "checkpoint.pt.tmp"
-            torch.save({"format_version": 1, "model_state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
+            torch.save({"format_version": 2 if config.get("downstream") else 1,
+                        **{key: metrics[key] for key in ("downstream", "input_contract") if key in metrics},
+                        "best_validation_loss": best_loss,
+                        "model_state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
                         "config": config, "label_map": manifest["label_map"], "best_epoch": best_epoch,
                         **{key: metrics[key] for key in ("initialization", "initial_state_sha256", "training_protocol")},
                         "dataset_manifest_sha256": metrics["dataset_manifest_sha256"],
@@ -492,7 +577,8 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
 
     checkpoint = torch.load(output / "checkpoint.pt", map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
-    metrics.update(history=history, best_epoch=best_epoch, diagnostics=diagnostics)
+    metrics.update(history=history, best_epoch=best_epoch, best_validation_loss=best_loss,
+                   performance=_performance(history), diagnostics=diagnostics)
     metrics["checkpoint_sha256"] = sha256_file(output / "checkpoint.pt")
     for split in ("validation", "test"):
         metrics[split] = _evaluate_split(model, loaders[split], device, manifest, config, split, output, metrics)
@@ -512,12 +598,16 @@ def evaluate_run(checkpoint_path: str | Path, *, output_dir: str | Path,
     if any((output / name).exists() for name in ("checkpoint.pt", "history.json", "scores")):
         raise FileExistsError(f"Evaluation output contains an existing training run: {output}. Choose a separate directory.")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    if checkpoint.get("format_version") != 1:
-        raise ValueError("Expected a streaming classification checkpoint (format_version=1).")
+    if checkpoint.get("format_version") not in {1, 2}:
+        raise ValueError("Expected a streaming classification checkpoint (format_version=1 or 2).")
     manifest = json.loads((checkpoint_path.parent / "dataset_manifest.json").read_text(encoding="utf-8"))
     if _manifest_digest(manifest) != checkpoint["dataset_manifest_sha256"]:
         raise ValueError("Dataset manifest differs from the manifest saved with the checkpoint.")
     config = checkpoint["config"]
+    if checkpoint["format_version"] == 2:
+        if (not config.get("downstream") or checkpoint.get("input_contract") != encoder_contract(config["model"], config["data"])
+            or checkpoint.get("downstream", {}).get("mode") != config["downstream"]["mode"]):
+            raise ValueError("Incompatible downstream checkpoint contract/configuration.")
     config["output_dir"] = str(output_dir)
     if manifest.get("version") == 2:
         partitions = load_partition_manifest(checkpoint_path.parent / "partitions.json")
@@ -537,21 +627,24 @@ def evaluate_run(checkpoint_path: str | Path, *, output_dir: str | Path,
     _positive_integer(config["training"]["num_workers"], "num_workers", 0)
     resolved_device = resolve_device(config["training"]["device"])
     torch.set_num_threads(config["training"]["cpu_threads"])
-    model = _make_model(config, manifest["label_map"]).to(resolved_device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model = _make_model(config, manifest["label_map"], initialize_encoder=False).to(resolved_device)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     preflight = json.loads((checkpoint_path.parent / "preflight.json").read_text(encoding="utf-8"))
     metrics = _base_metrics(config, manifest, preflight, resolved_device)
     metrics.update({key: checkpoint.get(key) for key in ("initialization", "initial_state_sha256", "training_protocol")})
+    metrics.update({key: checkpoint[key] for key in ("downstream", "input_contract", "best_validation_loss") if key in checkpoint})
     metrics["checkpoint_sha256"] = sha256_file(checkpoint_path)
     history_path = checkpoint_path.parent / "history.json"
     metrics.update(best_epoch=checkpoint["best_epoch"], history=json.loads(history_path.read_text()) if history_path.exists() else [],
                    checkpoint_path=str(checkpoint_path.resolve()), diagnostics={"scope": "validation and test rows only"})
+    metrics["performance"] = _performance(metrics["history"])
     for split in ("validation", "test"):
         metrics[split] = _evaluate_split(model, _loader(manifest, config, split), resolved_device,
                                         manifest, config, split, output, metrics)
     _record_split_counts(metrics)
     _finish_diagnostics(metrics["diagnostics"])
     output.mkdir(parents=True, exist_ok=True)
+    (output / "resolved_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     if manifest.get("version") == 2:
         _write_json(output / "dataset_manifest.json", manifest)
         _write_json(output / "partitions.json", partitions)

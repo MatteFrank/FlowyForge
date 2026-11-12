@@ -59,23 +59,39 @@ class FoundationEncoder(ModelPlugin):
 
 
 class EventClassificationModel(ModelPlugin):
-    def __init__(self, encoder: FoundationEncoder, num_classes: int) -> None:
+    def __init__(self, encoder: FoundationEncoder, num_classes: int, *,
+                 head_type: str = "mlp", freeze_encoder: bool = False) -> None:
         super().__init__()
         if type(num_classes) is not int or num_classes < 2:
             raise ValueError("Classification requires at least two classes.")
         self.encoder = encoder
         self.num_classes = num_classes
-        self.head = nn.Sequential(
+        if head_type not in {"mlp", "linear"}:
+            raise ValueError("head_type must be mlp or linear.")
+        self.head_type, self.freeze_encoder = head_type, freeze_encoder
+        self.head = nn.Linear(encoder.output_dim, num_classes) if head_type == "linear" else nn.Sequential(
             nn.LayerNorm(encoder.output_dim),
             nn.Linear(encoder.output_dim, encoder.output_dim), nn.GELU(),
             nn.Linear(encoder.output_dim, num_classes),
         )
+        if freeze_encoder:
+            self.encoder.requires_grad_(False)
+            self.encoder.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_encoder:
+            self.encoder.eval()
+        return self
 
     @property
     def name(self) -> str:
         return "event_classification"
 
     def encode(self, batch: EventBatch) -> torch.Tensor:
+        if self.freeze_encoder:
+            with torch.no_grad():
+                return self.encoder.encode(batch)
         return self.encoder.encode(batch)
 
     def forward(self, batch: EventBatch, task: str | None = None) -> torch.Tensor:
@@ -84,9 +100,11 @@ class EventClassificationModel(ModelPlugin):
         return self.head(self.encode(batch))
 
     @classmethod
-    def from_encoder_checkpoint(cls, path, num_classes: int, *, expected_contract=None):
+    def from_encoder_checkpoint(cls, path, num_classes: int, *, expected_contract=None,
+                                head_type="mlp", freeze_encoder=False):
         """Strictly restore a transferable encoder and initialize a new head."""
-        return cls(load_encoder(path, expected_contract=expected_contract), num_classes)
+        return cls(load_encoder(path, expected_contract=expected_contract), num_classes,
+                   head_type=head_type, freeze_encoder=freeze_encoder)
 
 
 class MaskedReconstructionModel(nn.Module):
@@ -141,7 +159,12 @@ def export_encoder(path, encoder: FoundationEncoder, contract: dict, provenance:
 
 
 def load_encoder(path, *, expected_contract: Mapping | None = None) -> FoundationEncoder:
+    from flowyforge.data_plugins.collide_v2.provenance import sha256_file
+
+    fingerprint = sha256_file(path)
     payload = torch.load(path, map_location="cpu", weights_only=True)
+    if sha256_file(path) != fingerprint:
+        raise ValueError("Encoder checkpoint changed while loading.")
     if payload.get("kind") != "flowyforge.masked_encoder" or payload.get("version") != 1:
         raise ValueError("Unsupported transferable encoder checkpoint kind/version.")
     contract = payload.get("contract", {})
@@ -158,6 +181,10 @@ def load_encoder(path, *, expected_contract: Mapping | None = None) -> Foundatio
     except (KeyError, RuntimeError) as exc:
         raise ValueError(f"Incompatible encoder weights (strict key/shape check): {exc}") from exc
     encoder.input_contract = contract
+    encoder.checkpoint_provenance = payload.get("provenance", {})
+    if not isinstance(encoder.checkpoint_provenance, dict):
+        raise ValueError("Invalid encoder provenance: expected a mapping.")
+    encoder.checkpoint_sha256 = fingerprint
     return encoder
 
 

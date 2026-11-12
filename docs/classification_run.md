@@ -333,3 +333,50 @@ che riusa le partizioni e l'encoder senza cambiare questo riferimento supervisio
 Il suo checkpoint completo supporta resume; `encoder.pt` supporta caricamento
 rigoroso nel classificatore con testa nuova. Procedura e limitazioni nel
 [README](../README.md#pretraining-con-masking-encoder-trasferibile-fullreco-e-l1t-separati).
+
+## Estensione downstream: punti di integrazione e compatibilità
+
+L'audit del riferimento `main@89f609e` ha identificato `_make_model`,
+`_run_epoch`, il salvataggio/caricamento del checkpoint e i controlli del
+comparatore come punti di estensione. Il reader e il Perceiver non sono modificati.
+Il training supervisionato rimane in un solo ciclo; non esiste un secondo
+framework o un runner downstream duplicato.
+
+| Componente | Responsabilità downstream |
+| --- | --- |
+| `load_run_config` | Sezione opzionale `downstream`; tre modalità, checkpoint e prerequisiti del benchmark |
+| `_make_model` | Legacy invariato; benchmark con testa lineare comune, caricamento tramite API esistente e contratto rigoroso |
+| `EventClassificationModel.train/encode` | Encoder congelato sempre in eval e senza autograd nel probe |
+| `_run_epoch` | Stesso ciclo cross-entropy; optimizer solo sui parametri allenabili, durata/throughput |
+| `run_classification` | Provenienza, selezione validation, fingerprint, score e checkpoint v2 |
+| `evaluate_run` | Ripristino completo da checkpoint v1/v2, senza dipendenza dal file encoder sorgente |
+| `_load_comparison_run` | Controlli comuni di partizioni, identità e score per entrambi i comparatori |
+| `compare_downstream_runs` | Protocollo comune, freezing e fingerprint; tabelle, ROC e learning curves |
+
+La sezione `downstream` assente conserva la testa MLP legacy, le chiavi dei pesi
+e la sequenza di inizializzazione casuale. La configurazione
+`collide_supervised.yaml` resta invariata. Il benchmark esplicito usa invece
+`nn.Linear(output_dim, num_classes)` in tutte le modalità, con la struttura del
+tokenizer del pretraining anche in scratch. L'identità iniziale della testa viene
+verificata; i pesi iniziali dell'encoder possono differire tra scratch e transfer.
+
+I checkpoint v2 salvano anche contratto, provenienza e stato del freezing. Per
+valutare si ricostruisce l'architettura e si carica l'intero state dict con controllo
+rigoroso; non si riapre il file `encoder.pt` originale. Il comparatore richiede il
+checkpoint classificatore, verificato tramite SHA256, ma non i dati raw né
+l'export pretraining originale. Per directory di rivalutazione usa il percorso
+`checkpoint_path` registrato. Mantenerlo accessibile dopo eventuali spostamenti.
+
+I controlli della provenienza si riferiscono ai metadati e agli hash presenti
+negli artefatti; non dimostrano identità fisica tra eventi di sorgenti diverse e
+non sostituiscono un audit della produzione dei dati. Il protocollo non ammette
+pretraining su partizioni diverse in questo benchmark.
+
+Le durate sono wall-clock e includono l'I/O dei batch. Il throughput è il numero
+di eventi processati diviso la somma delle durate train; non misura FLOPS, tempo
+di solo kernel o accelerazione di hardware differenti. Le curve train riportano
+metriche online, quelle validation il modello a fine epoca. Solo il checkpoint
+scelto sulla validation viene utilizzato per gli score finali di test.
+
+Comandi completi per entrambe le viste, opzioni e interpretazione nel
+[README](../README.md#downstream-transfer-scratch-linear-probe-e-fine-tuning).

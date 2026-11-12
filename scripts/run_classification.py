@@ -11,8 +11,11 @@ from pathlib import Path
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/runs/classification.yaml")
-    parser.add_argument("--stage", choices=("partitions", "inspect", "train", "evaluate", "report", "compare"), default="train")
-    parser.add_argument("--run-dir", action="append", help="For compare: repeat for FullReco and L1T training/evaluation directories.")
+    parser.add_argument("--stage", choices=("partitions", "inspect", "train", "evaluate", "report", "compare", "compare-transfer"), default="train")
+    parser.add_argument("--run-dir", action="append", help="Repeat for two views (compare) or three downstream modes (compare-transfer).")
+    parser.add_argument("--downstream-mode", choices=("scratch", "linear_probe", "finetune"),
+                        help="Explicit benchmark with a common linear head; omitted preserves the legacy classifier.")
+    parser.add_argument("--encoder-checkpoint", help="Exported encoder.pt, required by linear_probe/finetune.")
     parser.add_argument("--partition-manifest", help="Create at --stage partitions; reuse for inspect/train. Path relative to cwd.")
     parser.add_argument("--mode", choices=("small", "eos"))
     parser.add_argument("--process", action="append", metavar="NAME=PATH_OR_GLOB",
@@ -37,21 +40,22 @@ def main() -> int:
     from flowyforge.core.config import load_yaml
 
     try:
-        if args.stage == "compare":
-            from flowyforge.analysis.classification_report import compare_classification_runs
+        if args.stage in {"compare", "compare-transfer"}:
+            from flowyforge.analysis.classification_report import compare_classification_runs, compare_downstream_runs
 
             invalid = [key for key, value in vars(args).items()
                        if value is not None and key not in {"stage", "config", "run_dir", "output_dir"}]
             if invalid or not args.run_dir or not args.output_dir:
-                raise ValueError("compare requires two --run-dir paths and --output-dir; no training/evaluation overrides.")
-            compare_classification_runs(args.run_dir, args.output_dir)
+                raise ValueError(f"{args.stage} requires --run-dir paths and --output-dir; no training/evaluation overrides.")
+            compare = compare_classification_runs if args.stage == "compare" else compare_downstream_runs
+            compare(args.run_dir, args.output_dir)
             print(f"Verified comparison: {Path(args.output_dir) / 'comparison.html'}")
             return 0
         if args.run_dir:
-            raise ValueError("--run-dir is only used by --stage compare.")
+            raise ValueError("--run-dir is only used by --stage compare or compare-transfer.")
         if args.stage in {"evaluate", "report"}:
             invalid = [name for name in ("mode", "process", "process_name", "max_events_per_class",
-                                         "view", "model_config", "epochs", "seed", "partition_manifest") if getattr(args, name) is not None]
+                                         "view", "model_config", "epochs", "seed", "partition_manifest", "downstream_mode", "encoder_checkpoint") if getattr(args, name) is not None]
             if args.stage == "report" and args.data_root is not None:
                 invalid.append("data_root")
             if invalid:

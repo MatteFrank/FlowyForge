@@ -5,8 +5,10 @@ ObjectTokenizer → Perceiver → embedding dell'evento → classification head*
 Lo stesso runner legge piccoli campioni e dataset completi in streaming, allena
 su CPU/CUDA/MPS e produce valutazione e report. Il riferimento supervisionato usa
 etichette di processo. Un secondo entrypoint esegue il pretraining con masking
-dello stesso encoder ed esporta i pesi trasferibili; le prestazioni scientifiche
-del pretraining e del transfer non sono ancora validate.
+dello stesso encoder ed esporta i pesi trasferibili. Il runner di classificazione
+supporta anche scratch, linear probe e fine-tuning con un comparatore dedicato;
+le prestazioni scientifiche del pretraining e del transfer su dati reali non
+sono ancora validate.
 
 La baseline B1/MLP, la vettorizzazione scalare, il preprocessing `.npy`, il vecchio
 runner HF B1 e il trainer foundation smoke duplicato sono stati rimossi. I dati e
@@ -73,6 +75,7 @@ Parquet nested → manifest/schema/unità → stream di EventBatch con masks
 | `--stage evaluate` | Ricarica il checkpoint e rivaluta validation/test sugli stessi split del manifest |
 | `--stage report` | Rigenera CSV, figure e HTML da `metrics.json`, senza leggere i Parquet |
 | `--stage compare` | Verifica eventi, split, protocollo e score di due run FullReco/L1T, poi confronta le metriche |
+| `--stage compare-transfer` | Verifica e confronta scratch, linear probe e fine-tuning della stessa vista |
 
 `train` è autonomo rispetto a `inspect`, ma non scarica dati da HF. L'ispezione
 separata consente di verificare classi, schema e unità prima di impegnare risorse.
@@ -727,7 +730,8 @@ Il passo 4 aggiunge **`scripts/run_pretraining.py`**, che riusa reader, partizio
 collation, device e `FoundationEncoder` del classificatore. Non scarica dati,
 non ricampiona gli eventi e non esegue il training supervisionato. I comandi
 precedenti restano funzionanti. Non sono implementati allineamento fra viste,
-batch accoppiati o un confronto scientifico fine-tuning/linear probe.
+batch accoppiati. Il benchmark downstream scratch/linear probe/fine-tuning è
+descritto nella sezione successiva.
 
 ```text
 partitions.json + Parquet nested → solo split train / validation
@@ -939,10 +943,9 @@ per collection e metadati evento/oggetto, tokenizzando una sola volta. Gli indic
 `object_indices` nei metadati risalgono alle posizioni originali prima di sort e
 troncamento. `encode(batch)` conserva l'interfaccia precedente.
 
-Il runner supervisionato continua a inizializzare da zero per preservare il
-riferimento del passo 3. Non è stata aggiunta un'opzione che trasformi di nascosto
-quel riferimento in fine-tuning; qui sono disponibili export, caricamento e test
-di forward con una testa nuova.
+La configurazione del riferimento supervisionato del passo 3 continua a
+inizializzare da zero. Il workflow downstream descritto sotto attiva esplicitamente
+il caricamento dell'encoder, senza modificare il riferimento precedente.
 
 ### Smoke offline riproducibile
 
@@ -992,6 +995,240 @@ il resume; ad esempio:
 python scripts/run_pretraining.py --config outputs/perceiver/pretraining_smoke/config.yaml --stage inspect --view FullReco --output-dir outputs/perceiver/pretraining_smoke/inspect_fullreco
 python scripts/run_pretraining.py --config outputs/perceiver/pretraining_smoke/config.yaml --view FullReco --output-dir outputs/perceiver/pretraining_smoke/fullreco --resume outputs/perceiver/pretraining_smoke/fullreco/checkpoint.pt --epochs 3
 ```
+
+## Downstream transfer: scratch, linear probe e fine-tuning
+
+Il benchmark usa **lo stesso `scripts/run_classification.py`**, lo stesso reader,
+la stessa loss cross-entropy, gli stessi split e lo stesso ciclo di training del
+riferimento supervisionato. Il pretraining con masking resta separato.
+`configs/runs/collide_supervised.yaml` non è modificato: senza una sezione
+`downstream` o nuove opzioni CLI il runner mantiene encoder casuale e testa MLP
+legacy, inclusa la lettura dei checkpoint versione 1.
+
+Per un confronto controllato usare **`configs/runs/collide_downstream.yaml`**:
+una configurazione comune per FullReco e L1T, selezionate con `--view`, e un
+`resolved_config.yaml` distinto in ogni directory. Le impostazioni di modello,
+feature, collections, limiti, optimizer e campionamento sono quelle del pilot.
+Il task è ttbar semileptonico contro W+jets; **il segnale è
+`tt0123j_5f_ckm_LO_MLM_semiLeptonic`**. Seed 42, 3 epoche, batch 16, AdamW
+learning rate 0.001 sono un protocollo iniziale riproducibile, non un tuning.
+
+| `downstream.mode` / `--downstream-mode` | Encoder | Testa | Parametri aggiornati |
+| --- | --- | --- | --- |
+| `scratch` | Inizializzato casualmente | `Linear(output_dim, 2)` nuova | Encoder e testa |
+| `linear_probe` | Caricato da `encoder.pt`, congelato e sempre in eval | `Linear(output_dim, 2)` nuova | Solo testa |
+| `finetune` | Caricato dallo stesso `encoder.pt` del probe | `Linear(output_dim, 2)` nuova | Encoder e testa |
+
+**Tutte e tre le modalità del benchmark hanno una testa strettamente lineare**,
+senza normalizzazione, attivazione o dropout nella testa. Lo stesso seed e la
+stessa architettura producono gli stessi pesi iniziali della testa, verificati
+anche dal comparatore. Nel linear probe `model.train()` lascia l'encoder in
+`eval()` e `requires_grad=False`; il forward dell'encoder avviene senza autograd.
+L'optimizer riceve solo i parametri allenabili. Non vengono memorizzati in RAM
+gli embedding di tutti gli eventi.
+
+Lo scratch del benchmark abilita la struttura di tokenizer usata dal pretraining,
+compresi gli indicatori di masking, così le chiavi e le dimensioni coincidono con
+le altre modalità. Non applica masking durante la classificazione. I parametri
+degli indicatori sono presenti ma non partecipano al forward downstream quando
+nessuna feature è nascosta; i conteggi allenabili indicano `requires_grad=True`.
+Questo scratch è un riferimento nuovo con testa lineare: non sostituisce il
+riferimento legacy con testa MLP e non va mescolato con esso nel comparatore.
+
+### Prerequisiti e configurazione
+
+Preparare il pilot e creare una sola volta
+`data/processed/collide_pilot/partitions.json`, come documentato sopra.
+Per probe e fine-tuning occorre completare il pretraining della vista scelta e
+avere i due export:
+
+```text
+outputs/perceiver/pretraining_fullreco/encoder.pt
+outputs/perceiver/pretraining_l1t/encoder.pt
+```
+
+I due export devono provenire dalle **stesse partizioni del downstream**. Il
+caricamento usa `load_encoder`/`from_encoder_checkpoint` con controllo rigoroso
+di chiavi, dimensioni, architettura, vista, ordine/significato delle feature,
+collections, limiti, trasformazioni e unità. Verifica inoltre la provenienza
+registrata: hash delle partizioni uguale, pretraining sul train, selezione sulla
+validation e `test_used: false`. Non accetta un encoder L1T per un run FullReco,
+né un encoder con provenance mancante o partizioni diverse.
+
+Le nuove opzioni sono:
+
+```yaml
+downstream:
+  mode: linear_probe
+  encoder_checkpoint: outputs/perceiver/pretraining_fullreco/encoder.pt
+```
+
+`--downstream-mode` e `--encoder-checkpoint` prevalgono sullo YAML.
+`encoder_checkpoint` è relativo alla directory di lavoro, come i dati e gli
+output. In `scratch` deve essere `null`/omesso; nelle altre modalità è obbligatorio.
+Il benchmark richiede `partition_manifest` ed `evaluation.signal_process` per
+produrre score identificabili e tutte le metriche binarie. Le opzioni già
+esistenti per sorgenti HF materializzate, Parquet locali/EOS, device, batch e
+worker rimangono disponibili. Non vengono effettuati download o mount automatici.
+
+### Ispezione e training FullReco
+
+Dalla radice del repository, con la venv attiva, i comandi seguenti sono uguali
+su macOS, Linux, Windows e HPC. Scegliere directory nuove per nuovi esperimenti;
+un training già presente è protetto da sovrascritture. Per usare CPU aggiungere
+`--device cpu`, per CUDA `--device cuda:0`. `inspect` non aggiorna pesi e può
+precedere il training nella stessa directory.
+
+```text
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage inspect --view FullReco --downstream-mode scratch --output-dir outputs/perceiver/downstream_fullreco_scratch
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage inspect --view FullReco --downstream-mode linear_probe --encoder-checkpoint outputs/perceiver/pretraining_fullreco/encoder.pt --output-dir outputs/perceiver/downstream_fullreco_linear_probe
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage inspect --view FullReco --downstream-mode finetune --encoder-checkpoint outputs/perceiver/pretraining_fullreco/encoder.pt --output-dir outputs/perceiver/downstream_fullreco_finetune
+
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage train --view FullReco --downstream-mode scratch --output-dir outputs/perceiver/downstream_fullreco_scratch
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage train --view FullReco --downstream-mode linear_probe --encoder-checkpoint outputs/perceiver/pretraining_fullreco/encoder.pt --output-dir outputs/perceiver/downstream_fullreco_linear_probe
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage train --view FullReco --downstream-mode finetune --encoder-checkpoint outputs/perceiver/pretraining_fullreco/encoder.pt --output-dir outputs/perceiver/downstream_fullreco_finetune
+```
+
+### Ispezione e training L1T
+
+Riutilizzare le partizioni, ma scegliere l'encoder L1T e output distinti:
+
+```text
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage inspect --view L1T --downstream-mode scratch --output-dir outputs/perceiver/downstream_l1t_scratch
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage inspect --view L1T --downstream-mode linear_probe --encoder-checkpoint outputs/perceiver/pretraining_l1t/encoder.pt --output-dir outputs/perceiver/downstream_l1t_linear_probe
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage inspect --view L1T --downstream-mode finetune --encoder-checkpoint outputs/perceiver/pretraining_l1t/encoder.pt --output-dir outputs/perceiver/downstream_l1t_finetune
+
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage train --view L1T --downstream-mode scratch --output-dir outputs/perceiver/downstream_l1t_scratch
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage train --view L1T --downstream-mode linear_probe --encoder-checkpoint outputs/perceiver/pretraining_l1t/encoder.pt --output-dir outputs/perceiver/downstream_l1t_linear_probe
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage train --view L1T --downstream-mode finetune --encoder-checkpoint outputs/perceiver/pretraining_l1t/encoder.pt --output-dir outputs/perceiver/downstream_l1t_finetune
+```
+
+Questi comandi avviano il pilot solo quando eseguiti dall'utente. `train` seleziona
+sempre la minima validation loss; solo dopo carica il checkpoint scelto e produce
+le metriche e gli score finali di validation/test. Il test non entra nella loss
+di training né nella selezione. Non utilizzare i risultati del test per cambiare
+epoche, learning rate, modalità, seed o checkpoint di pretraining.
+
+### Valutazione e confronto dei tre esperimenti
+
+`train` include già la valutazione. Per ripeterla con un batch/device diverso,
+usare una nuova directory. La modalità e il contratto vengono letti dal
+checkpoint: non passare `--view`, `--downstream-mode` o `--encoder-checkpoint`
+a `evaluate`.
+
+```text
+python scripts/run_classification.py --stage evaluate --checkpoint outputs/perceiver/downstream_fullreco_finetune/checkpoint.pt --device cpu --output-dir outputs/perceiver/downstream_fullreco_finetune_evaluation
+python scripts/run_classification.py --stage evaluate --checkpoint outputs/perceiver/downstream_l1t_linear_probe/checkpoint.pt --device cpu --output-dir outputs/perceiver/downstream_l1t_linear_probe_evaluation
+
+python scripts/run_classification.py --stage compare-transfer --run-dir outputs/perceiver/downstream_fullreco_scratch --run-dir outputs/perceiver/downstream_fullreco_linear_probe --run-dir outputs/perceiver/downstream_fullreco_finetune --output-dir outputs/perceiver/transfer_comparison_fullreco
+python scripts/run_classification.py --stage compare-transfer --run-dir outputs/perceiver/downstream_l1t_scratch --run-dir outputs/perceiver/downstream_l1t_linear_probe --run-dir outputs/perceiver/downstream_l1t_finetune --output-dir outputs/perceiver/transfer_comparison_l1t
+```
+
+`compare-transfer` richiede esattamente un run per modalità, tutti della **stessa
+vista**. Accetta directory di training o di rivalutazione, purché il checkpoint
+del classificatore sia ancora accessibile. Prima di scrivere output verifica:
+
+- stessi ID evento e label in tutti gli split, binding coerente e hash delle
+  partizioni identico; score validation/test coerenti con le appartenenze;
+- stesso task, vista, contratto delle feature, architettura, seed, batch size,
+  epoche, optimizer e relativo protocollo; stessa definizione di segnale e
+  frazione di background accettato;
+- testa lineare comune con identico fingerprint iniziale; stesso checkpoint
+  preaddestrato e pesi iniziali dell'encoder per probe e fine-tuning;
+- hash del checkpoint classificatore e degli shard score, metadati coerenti con
+  i pesi salvati, conteggi dei parametri, encoder del probe invariato e scelta
+  dell'epoca tramite minima loss di validation;
+- ROC-AUC/efficienza ricalcolate dagli score persistiti.
+
+Sono ammesse le differenze intenzionali nell'inizializzazione dell'encoder,
+nel freezing e nel numero di parametri allenabili. Device, thread CPU e frequenza
+di logging possono differire, ma i tempi sono confrontabili solo su risorse e
+condizioni di I/O equivalenti. Il comparatore non sceglie un vincitore in base
+al test. `--stage compare` conserva il precedente confronto fra FullReco e L1T
+con inizializzazione casuale e non sostituisce `compare-transfer`.
+
+### Output e interpretazione
+
+Ogni run downstream salva gli artefatti del classificatore: configurazione
+risolta, `partitions.json`, `dataset_manifest.json`, preflight, history,
+`checkpoint.pt`, `metrics.json`, report HTML, CSV e figure. Gli score sono in
+`scores/validation/` e `scores/test/`, in shard Parquet con `event_id`, label,
+score del segnale e split.
+
+I checkpoint downstream hanno **`format_version: 2`** e contengono encoder e
+testa completi. La valutazione non ha bisogno dell'originale `encoder.pt`, pur
+conservandone percorso, hash e provenienza. I checkpoint legacy versione 1 restano
+caricabili. Non è introdotto resume del training downstream; il resume del
+pretraining rimane disponibile separatamente.
+
+In `metrics.json`, la sezione `downstream` registra modalità, freezing, origine
+dell'encoder, fingerprint iniziali/selezionati e parametri totali/allenabili di
+encoder e testa. `input_contract`, `training_protocol`, `checkpoint_sha256`,
+`best_epoch` e `best_validation_loss` rendono esplicite le condizioni del run.
+`performance` riporta durata aggregata del train, eventi processati su tutte le
+epoche e throughput; ciascuno split valutato registra durata ed eventi/secondo.
+Il tempo train include lettura/trasferimento dei batch e ottimizzazione, esclude
+preflight, valutazione finale e report; il costo del pretraining non è incluso.
+
+Il confronto salva `comparison.json`, `comparison.csv`, `comparison.html`,
+`learning_curves.csv` e `plots/{roc_validation,roc_test,learning_curves}.{png,pdf}`.
+L'HTML contiene le figure incorporate e si apre senza server. La tabella affianca
+validation loss, best epoch, accuracy, macro-F1, ROC-AUC, efficienza del segnale,
+conteggi, parametri e tempi.
+
+Accuracy e macro-F1 usano la classe predetta; ROC-AUC misura l'ordinamento degli
+score. L'efficienza è un punto della ROC empirica a FPR non superiore al target,
+con score uguali accettati insieme. `insufficient_background_resolution` significa
+**efficienza non stimabile**, non zero. Il target default è 1%, con almeno 10
+background attesi al target: è un controllo di risoluzione, non un intervallo
+di confidenza né una soglia di deployment calibrata sulla validation.
+
+Un probe misura quanto la rappresentazione sia accessibile a una separazione
+lineare; il fine-tuning misura l'adattamento supervisionato dell'intero encoder.
+Il confronto a protocollo fisso non dimostra che ciascuna modalità sia ottimizzata.
+Servono più seed, incertezze, controllo della rappresentatività del campione e
+una procedura di tuning fissata sulla validation per conclusioni scientifiche.
+Non sono introdotti pesi di luminosità/cross-section, deduplicazione fisica fra
+sorgenti, Graph, MoE o allineamento fra viste.
+
+### Verifiche downstream effettivamente eseguite
+
+Il 12 novembre 2026 sono stati eseguiti smoke CLI **solo su CPU e dati sintetici**,
+in `outputs/perceiver/downstream_transfer_smoke_20261112/`. Il campione contiene
+20 eventi per processo: 24 train, 8 validation e 8 test condivisi dalle due viste.
+Il modello ridotto ha embedding/output 8, 2 latenti e un solo blocco Perceiver: non
+è il pilot scientifico. Sono state eseguite una epoca di pretraining per vista,
+due epoche per ciascuno dei sei run downstream, entrambi i confronti e una
+rivalutazione FullReco fine-tuning con batch size 5.
+
+Lo scratch e il fine-tuning hanno 2.426 parametri allenabili; il probe ne ha 18,
+tutti nella testa. I fingerprint confermano encoder invariato nei due probe e
+aggiornato nei fine-tuning. Questi controlli verificano la meccanica del transfer;
+le metriche del toy sample non misurano prestazioni su ttbar/W+jets reali. Nessun
+training sul pilot reale, GPU o EOS è stato avviato.
+
+Aprire i report:
+
+- `outputs/perceiver/downstream_transfer_smoke_20261112/comparison_FullReco/comparison.html`;
+- `outputs/perceiver/downstream_transfer_smoke_20261112/comparison_L1T/comparison.html`.
+
+La directory contiene `model.yaml`, `downstream.yaml`, `pretraining.yaml`,
+`partitions.json` e `commands.json` con gli argomenti CLI effettivamente eseguiti.
+Non rieseguire i comandi di training sugli stessi output; scegliere directory
+nuove. Per un'ispezione del probe già configurato:
+
+```text
+python scripts/run_classification.py --config outputs/perceiver/downstream_transfer_smoke_20261112/downstream.yaml --stage inspect --view FullReco --downstream-mode linear_probe --encoder-checkpoint outputs/perceiver/downstream_transfer_smoke_20261112/pretraining_FullReco/encoder.pt --output-dir outputs/perceiver/downstream_transfer_smoke_20261112/new_inspection
+python -m pytest tests/test_downstream_transfer.py -q
+python -m pytest tests/ -q
+```
+
+La verifica finale `python3 -m pytest tests/ -q` ha completato **109 test passati**,
+con 17 casi downstream aggiunti. Sono rimasti soltanto gli avvisi di deprecazione
+Matplotlib/Pillow già presenti nei report. I test verificano caricamento e
+contratti incompatibili, freezing/eval, gradienti e aggiornamenti, esclusione
+del test dalla selezione, score/ID, rifiuto di protocolli o encoder diversi,
+checkpoint autonomi, CLI e compatibilità legacy.
 
 ## EOS/LXPLUS o altro filesystem HPC
 

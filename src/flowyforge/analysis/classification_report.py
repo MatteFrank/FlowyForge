@@ -151,14 +151,83 @@ def read_evaluation_scores(path):
     return manifest, ids, labels, scores
 
 
+def _load_comparison_run(directory, *, require_scratch=True):
+    """Shared manifest/identity/score checks for view and downstream comparisons."""
+    from flowyforge.data_plugins.collide_v2.streaming import load_partition_manifest
+
+    metrics = json.loads((directory / "metrics.json").read_text(encoding="utf-8"))
+    if not metrics.get("config", {}).get("evaluation", {}).get("signal_process"):
+        raise ValueError("Comparison requires binary evaluation with shared partitions; use the supervised reference config.")
+    manifest = json.loads((directory / "dataset_manifest.json").read_text(encoding="utf-8"))
+    partitions = load_partition_manifest(directory / "partitions.json")
+    digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, allow_nan=False).encode()).hexdigest()
+    if (manifest.get("version") != 2 or digest != metrics.get("dataset_manifest_sha256") or
+        partitions["sha256"] != manifest.get("partition_sha256") or partitions["sha256"] != metrics.get("partition_sha256") or
+        manifest["label_map"] != metrics["label_map"] or manifest["label_map"] != partitions["label_map"] or
+        manifest["reader"]["view"] != metrics["view"]):
+        raise ValueError("Run dataset/partition manifest differs from evaluated metrics.")
+    if require_scratch and (metrics.get("initialization") != "random_from_scratch" or not metrics.get("initial_state_sha256")):
+        raise ValueError("Comparison requires a recorded random initialization from scratch.")
+    if metrics.get("checkpoint_selection") != "minimum validation loss":
+        raise ValueError("Comparison requires validation-based checkpoint selection.")
+    expected = {split: {} for split in ("train", "validation", "test")}
+    for process in partitions["processes"]:
+        for event in process["events"]:
+            if event["split"] is not None:
+                expected[event["split"]][event["id"]] = process["label"]
+    bound = {split: {} for split in expected}
+    for process in manifest["processes"]:
+        keys = [key for info in process["files"] for key in info["event_ids"]]
+        for split in expected:
+            for index in process["split_indices"][split]:
+                key = keys[index]
+                if key in bound[split]:
+                    raise ValueError("Duplicate event in run split binding.")
+                bound[split][key] = process["label"]
+    if bound != expected:
+        raise ValueError("Run events/splits differ from the saved partition memberships.")
+    arrays = {}
+    for split in ("validation", "test"):
+        # Fixed layout prevents a metrics file from redirecting score reads.
+        score_manifest, ids, labels, scores = read_evaluation_scores(directory / "scores" / split / "manifest.json")
+        context = score_manifest["context"]
+        if (dict(zip(ids, labels.tolist())) != expected[split] or
+            any(context.get(key) != metrics.get(key) for key in
+                ("partition_sha256", "dataset_manifest_sha256", "checkpoint_sha256", "view", "label_map"))):
+            raise ValueError(f"Scored {split} events/labels/context differ from saved partitions/run.")
+        evaluation = metrics["config"]["evaluation"]
+        if (context["signal_process"] != evaluation["signal_process"] or
+            context["signal_label"] != metrics["label_map"].get(evaluation["signal_process"])):
+            raise ValueError("Score signal definition differs from run configuration.")
+        arrays[split] = (labels, scores)
+    return metrics, arrays
+
+
+def _comparison_rows(metrics, arrays):
+    rows = []
+    settings = metrics["config"]["evaluation"]
+    for split, (labels, scores) in arrays.items():
+        binary = compute_binary_metrics(scores, labels, signal_label=metrics["label_map"][settings["signal_process"]],
+                    background_acceptance=settings["background_acceptance"], min_background_events=settings["min_background_events"])
+        recorded = metrics[split]["binary"]
+        if any(recorded.get(key) != value for key, value in binary.items()):
+            raise ValueError("Recorded binary metrics differ from the persisted evaluation scores.")
+        point = binary["operating_point"]
+        rows.append({"view": metrics["view"], "split": split, "signal_process": settings["signal_process"],
+                     "best_epoch": metrics["best_epoch"], "accuracy": metrics[split]["accuracy"],
+                     "macro_f1": metrics[split]["macro_f1"], "roc_auc": binary["roc_auc"],
+                     "num_signal": binary["num_signal"], "num_background": binary["num_background"],
+                     **{key: point[key] for key in ("target_background_acceptance", "signal_efficiency",
+                                                   "achieved_background_acceptance", "accepted_background", "status")}})
+    return rows
+
+
 def compare_classification_runs(run_dirs, output_dir):
     """Compare two views only after matching partitions, protocol and scored IDs.
 
     Accept training or standalone evaluation directories; no raw data/model load.
     Exact ROC uses scalar arrays, not physical event objects or model tensors.
     """
-    from flowyforge.data_plugins.collide_v2.streaming import load_partition_manifest
-
     paths = [Path(path).expanduser().resolve() for path in run_dirs]
     if len(paths) != 2 or paths[0] == paths[1]:
         raise ValueError("Comparison requires two distinct run directories.")
@@ -167,51 +236,7 @@ def compare_classification_runs(run_dirs, output_dir):
         raise FileExistsError("Comparison output must be new or empty; refusing to overwrite existing artifacts.")
     runs, scored = [], []
     for directory in paths:
-        metrics = json.loads((directory / "metrics.json").read_text(encoding="utf-8"))
-        if not metrics.get("config", {}).get("evaluation", {}).get("signal_process"):
-            raise ValueError("Comparison requires binary evaluation with shared partitions; use the supervised reference config.")
-        manifest = json.loads((directory / "dataset_manifest.json").read_text(encoding="utf-8"))
-        partitions = load_partition_manifest(directory / "partitions.json")
-        digest = hashlib.sha256(json.dumps(manifest, sort_keys=True, allow_nan=False).encode()).hexdigest()
-        if (manifest.get("version") != 2 or digest != metrics.get("dataset_manifest_sha256") or
-            partitions["sha256"] != manifest.get("partition_sha256") or partitions["sha256"] != metrics.get("partition_sha256") or
-            manifest["label_map"] != metrics["label_map"] or manifest["label_map"] != partitions["label_map"] or
-            manifest["reader"]["view"] != metrics["view"]):
-            raise ValueError("Run dataset/partition manifest differs from evaluated metrics.")
-        if metrics.get("initialization") != "random_from_scratch" or not metrics.get("initial_state_sha256"):
-            raise ValueError("Comparison requires a recorded random initialization from scratch.")
-        if metrics.get("checkpoint_selection") != "minimum validation loss":
-            raise ValueError("Comparison requires validation-based checkpoint selection.")
-        expected = {split: {} for split in ("train", "validation", "test")}
-        for process in partitions["processes"]:
-            for event in process["events"]:
-                if event["split"] is not None:
-                    expected[event["split"]][event["id"]] = process["label"]
-        bound = {split: {} for split in expected}
-        for process in manifest["processes"]:
-            keys = [key for info in process["files"] for key in info["event_ids"]]
-            for split in expected:
-                for index in process["split_indices"][split]:
-                    key = keys[index]
-                    if key in bound[split]:
-                        raise ValueError("Duplicate event in run split binding.")
-                    bound[split][key] = process["label"]
-        if bound != expected:
-            raise ValueError("Run events/splits differ from the saved partition memberships.")
-        arrays = {}
-        for split in ("validation", "test"):
-            # Fixed layout prevents a metrics file from redirecting score reads.
-            score_manifest, ids, labels, scores = read_evaluation_scores(directory / "scores" / split / "manifest.json")
-            context = score_manifest["context"]
-            if (dict(zip(ids, labels.tolist())) != expected[split] or
-                any(context.get(key) != metrics.get(key) for key in
-                    ("partition_sha256", "dataset_manifest_sha256", "checkpoint_sha256", "view", "label_map"))):
-                raise ValueError(f"Scored {split} events/labels/context differ from saved partitions/run.")
-            evaluation = metrics["config"]["evaluation"]
-            if (context["signal_process"] != evaluation["signal_process"] or
-                context["signal_label"] != metrics["label_map"].get(evaluation["signal_process"])):
-                raise ValueError("Score signal definition differs from run configuration.")
-            arrays[split] = (labels, scores)
+        metrics, arrays = _load_comparison_run(directory)
         runs.append(metrics)
         scored.append(arrays)
     left, right = runs
@@ -224,22 +249,7 @@ def compare_classification_runs(run_dirs, output_dir):
         if left["config"]["evaluation"][key] != right["config"]["evaluation"][key]:
             raise ValueError(f"Runs are not comparable: evaluation.{key} differs.")
     # All event and protocol checks have passed before comparing any metrics.
-    rows = []
-    for metrics, arrays in zip(runs, scored):
-        settings = metrics["config"]["evaluation"]
-        for split, (labels, scores) in arrays.items():
-            binary = compute_binary_metrics(scores, labels, signal_label=metrics["label_map"][settings["signal_process"]],
-                        background_acceptance=settings["background_acceptance"], min_background_events=settings["min_background_events"])
-            recorded = metrics[split]["binary"]
-            if any(recorded.get(key) != value for key, value in binary.items()):
-                raise ValueError("Recorded binary metrics differ from the persisted evaluation scores.")
-            point = binary["operating_point"]
-            rows.append({"view": metrics["view"], "split": split, "signal_process": settings["signal_process"],
-                         "best_epoch": metrics["best_epoch"], "accuracy": metrics[split]["accuracy"],
-                         "macro_f1": metrics[split]["macro_f1"], "roc_auc": binary["roc_auc"],
-                         "num_signal": binary["num_signal"], "num_background": binary["num_background"],
-                         **{key: point[key] for key in ("target_background_acceptance", "signal_efficiency",
-                                                       "achieved_background_acceptance", "accepted_background", "status")}})
+    rows = [row for metrics, arrays in zip(runs, scored) for row in _comparison_rows(metrics, arrays)]
     comparison = {"version": 1, "run_dirs": list(map(str, paths)), "partition_sha256": left["partition_sha256"],
                   "verified": ["all selected event identities and split memberships", "score identities and labels",
                                "same architecture, reader settings except view, training protocol and initial weights",
@@ -253,6 +263,209 @@ def compare_classification_runs(run_dirs, output_dir):
                 '<p>Same events, partitions, training protocol and initial weights verified. '
                 'Unweighted empirical metrics; test results must not guide hyperparameter selection.</p>'
                 + _table(rows, list(rows[0])) + '</html>')
+    (output / "comparison.html").write_text(document, encoding="utf-8")
+    return comparison
+
+
+def _verify_downstream_checkpoint(directory, metrics):
+    """Cross-check recorded protocol, freezing and fingerprints against saved weights."""
+    import torch
+    from flowyforge.model_plugins.foundation_encoder import encoder_contract
+    from flowyforge.training.classification_run import _make_model, _parameter_counts, _initial_state_digest, _training_protocol
+    from flowyforge.data_plugins.collide_v2.streaming import _reader_config
+
+    checkpoint_path = directory / "checkpoint.pt"
+    if not checkpoint_path.is_file():
+        checkpoint_path = Path(metrics.get("checkpoint_path", ""))
+    if not checkpoint_path.is_file() or sha256_file(checkpoint_path) != metrics.get("checkpoint_sha256"):
+        raise ValueError("Downstream checkpoint missing or fingerprint differs from evaluated scores.")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if checkpoint.get("format_version") != 2 or not checkpoint.get("config", {}).get("downstream"):
+        raise ValueError("Transfer comparison requires explicit downstream runs (checkpoint format_version=2).")
+    config = checkpoint["config"]
+    downstream = metrics.get("downstream", {})
+    mode = config["downstream"]["mode"]
+    if mode not in {"scratch", "linear_probe", "finetune"}:
+        raise ValueError("Unsupported downstream mode.")
+    contract = encoder_contract(config["model"], config["data"])
+    for key in ("downstream", "input_contract", "training_protocol", "initial_state_sha256", "initialization", "label_map", "best_epoch", "best_validation_loss"):
+        if checkpoint.get(key) != metrics.get(key):
+            raise ValueError(f"Downstream metrics/checkpoint mismatch: {key}.")
+    if (downstream.get("mode") != mode or downstream.get("head_type") != "linear"
+        or downstream.get("version") != 1 or metrics["input_contract"] != contract
+        or metrics["training_protocol"] != _training_protocol(config)
+        or encoder_contract(metrics["config"]["model"], metrics["config"]["data"]) != contract
+        or metrics["config"].get("downstream") != config["downstream"]
+        or metrics["view"] != contract["reader"]["view"]):
+        raise ValueError("Downstream input contract, head or training protocol is inconsistent.")
+    manifest = json.loads((directory / "dataset_manifest.json").read_text())
+    if manifest["reader"] != _reader_config(**contract["reader"]):
+        raise ValueError("Downstream reader binding differs from the encoder contract.")
+    for key in ("signal_process", "background_acceptance", "min_background_events"):
+        if config["evaluation"][key] != metrics["config"]["evaluation"][key]:
+            raise ValueError(f"Downstream evaluation.{key} differs from checkpoint protocol.")
+    frozen = mode == "linear_probe"
+    if downstream.get("freezing") != ("encoder_frozen_eval" if frozen else "none"):
+        raise ValueError("Incorrect downstream freezing policy.")
+    with torch.random.fork_rng(devices=[]):
+        model = _make_model(config, metrics["label_map"], initialize_encoder=False)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    if (downstream.get("parameters") != _parameter_counts(model)
+        or downstream.get("selected_encoder_sha256") != _initial_state_digest(model.encoder)
+        or downstream.get("selected_head_sha256") != _initial_state_digest(model.head)):
+        raise ValueError("Downstream parameter counts or selected weight fingerprints are inconsistent.")
+    if frozen and downstream["initial_encoder_sha256"] != downstream["selected_encoder_sha256"]:
+        raise ValueError("Linear probe modified its frozen encoder.")
+    source = downstream.get("encoder_source")
+    if mode == "scratch":
+        if source is not None or metrics["initialization"] != "random_from_scratch":
+            raise ValueError("Scratch must use random initialization without an encoder source.")
+    else:
+        if (not source or not source.get("sha256") or metrics["initialization"] != "pretrained_encoder_new_head"
+            or source.get("provenance", {}).get("partition_sha256") != metrics["partition_sha256"]
+            or source["provenance"].get("test_used") is not False
+            or source["provenance"].get("pretraining_split") != "train"
+            or source["provenance"].get("checkpoint_selection_split") != "validation"):
+            raise ValueError("Incompatible pretraining provenance or test exclusion.")
+    history = metrics.get("history") or []
+    if (len(history) != config["training"]["epochs"]
+        or [item["epoch"] for item in history] != list(range(1, len(history) + 1))
+        or any(not math.isfinite(item["validation"]["loss"]) for item in history)):
+        raise ValueError("Incomplete or invalid downstream learning history.")
+    best = min(history, key=lambda item: item["validation"]["loss"])
+    if best["epoch"] != metrics["best_epoch"] or best["validation"]["loss"] != metrics["best_validation_loss"]:
+        raise ValueError("Checkpoint selection differs from minimum validation loss.")
+    for split in ("validation", "test"):
+        recomputed = compute_confusion_metrics(metrics[split]["confusion_matrix"], metrics["label_map"])
+        for key in ("accuracy", "macro_f1", "num_events"):
+            if recomputed[key] != metrics[split][key]:
+                raise ValueError(f"Recorded {split} {key} differs from confusion counts.")
+
+
+def compare_downstream_runs(run_dirs, output_dir):
+    """Compare all three modes for ONE view, after verifying experimental conditions."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+    from matplotlib.ticker import MaxNLocator
+    from flowyforge.training.classification_run import _performance
+
+    paths = [Path(path).expanduser().resolve() for path in run_dirs]
+    if len(paths) != 3 or len(set(paths)) != 3:
+        raise ValueError("Transfer comparison requires three distinct runs: scratch, linear_probe, finetune.")
+    output = Path(output_dir).expanduser().resolve()
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise FileExistsError("Comparison output must be new or empty; refusing to overwrite existing artifacts.")
+    runs, scored = {}, {}
+    for directory in paths:
+        metrics, arrays = _load_comparison_run(directory, require_scratch=False)
+        _verify_downstream_checkpoint(directory, metrics)
+        mode = metrics["downstream"]["mode"]
+        if mode in runs:
+            raise ValueError(f"Duplicate downstream mode: {mode}.")
+        runs[mode], scored[mode] = metrics, arrays
+    modes = ("scratch", "linear_probe", "finetune")
+    if set(runs) != set(modes):
+        raise ValueError("Transfer comparison requires scratch, linear_probe and finetune.")
+    reference = runs["scratch"]
+    for metrics in runs.values():
+        for key in ("view", "partition_sha256", "label_map", "input_contract", "training_protocol"):
+            if metrics[key] != reference[key]:
+                raise ValueError(f"Downstream runs are not comparable: {key} differs.")
+        for key in ("signal_process", "background_acceptance", "min_background_events"):
+            if metrics["config"]["evaluation"][key] != reference["config"]["evaluation"][key]:
+                raise ValueError(f"Downstream runs are not comparable: evaluation.{key} differs.")
+        if metrics["downstream"]["initial_head_sha256"] != reference["downstream"]["initial_head_sha256"]:
+            raise ValueError("Downstream runs must start with the same fresh linear head.")
+    probe, tuned = (runs[mode]["downstream"] for mode in ("linear_probe", "finetune"))
+    if (probe["encoder_source"]["sha256"] != tuned["encoder_source"]["sha256"]
+        or probe["initial_encoder_sha256"] != tuned["initial_encoder_sha256"]
+        or probe["encoder_source"]["provenance"] != tuned["encoder_source"]["provenance"]):
+        raise ValueError("Linear probe and fine-tuning must start from the same pretrained encoder.")
+    rows, learning = [], []
+    for mode in modes:
+        metrics = runs[mode]
+        performance = _performance(metrics["history"])
+        if performance != metrics.get("performance"):
+            raise ValueError("Recorded throughput/duration differ from learning history.")
+        for row in _comparison_rows(metrics, scored[mode]):
+            rows.append({"mode": mode, **row, "validation_loss": metrics["best_validation_loss"],
+                         "total_parameters": metrics["downstream"]["parameters"]["total"],
+                         "trainable_parameters": metrics["downstream"]["parameters"]["trainable"],
+                         "train_duration_seconds": performance["train_duration_seconds"],
+                         "train_events_per_second": performance["train_events_per_second"],
+                         "evaluation_duration_seconds": metrics[row["split"]]["duration_seconds"],
+                         "evaluation_events_per_second": metrics[row["split"]]["events_per_second"]})
+        learning.extend({"mode": mode, "epoch": item["epoch"], "train_loss": item["train_loss"],
+                         "validation_loss": item["validation"]["loss"], "train_accuracy": item["train_accuracy"],
+                         "validation_accuracy": item["validation"]["accuracy"]} for item in metrics["history"])
+    # No artifacts are created before all consistency checks, including metrics, pass.
+    comparison = {"version": 1, "kind": "downstream_transfer_comparison", "run_dirs": list(map(str, paths)),
+                  "view": reference["view"], "partition_sha256": reference["partition_sha256"],
+                  "training_protocol": reference["training_protocol"], "input_contract": reference["input_contract"],
+                  "verified": ["identical selected event IDs, split memberships, labels and task",
+                               "identical input contract, view, signal and optimization protocol",
+                               "same fresh linear head; same pretrained encoder for linear_probe/finetune",
+                               "checkpoint fingerprints, parameter counts and frozen encoder unchanged",
+                               "minimum validation loss selection; binary metrics recomputed from score shards"],
+                  "intentional_differences": ["encoder initialization", "encoder freezing and trainable parameter count"],
+                  "encoder_sources": {mode: runs[mode]["downstream"]["encoder_source"] for mode in modes},
+                  "results": rows}
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "comparison.json").write_text(json.dumps(comparison, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    _write_csv(output / "comparison.csv", rows, list(rows[0]))
+    _write_csv(output / "learning_curves.csv", learning, list(learning[0]))
+    plots = output / "plots"
+    plots.mkdir(exist_ok=True)
+    images = []
+    def save(fig, stem):
+        fig.savefig(plots / f"{stem}.png", dpi=160, facecolor="white")
+        fig.savefig(plots / f"{stem}.pdf", facecolor="white")
+        images.append((stem, base64.b64encode((plots / f"{stem}.png").read_bytes()).decode()))
+        fig.clear()
+    colors = {"scratch": "#2463a6", "linear_probe": "#df8b29", "finetune": "#278575"}
+    for split in ("validation", "test"):
+        fig = Figure(figsize=(7.5, 5.5), layout="constrained")
+        FigureCanvasAgg(fig)
+        ax = fig.subplots()
+        for mode in modes:
+            binary = runs[mode][split]["binary"]
+            roc = binary["roc"]
+            if roc:
+                ax.plot([p["false_positive_rate"] for p in roc], [p["true_positive_rate"] for p in roc],
+                        color=colors[mode], label=f"{mode}: AUC={binary['roc_auc']:.4f}")
+        ax.plot([0, 1], [0, 1], "--", color="gray", alpha=.6)
+        ax.set(xlabel="Accepted background fraction (FPR)", ylabel="Signal efficiency (TPR)",
+               title=f"{reference['view']} · {split} ROC", xlim=(0, 1), ylim=(0, 1.02))
+        ax.legend(frameon=False)
+        ax.grid(alpha=.2)
+        save(fig, f"roc_{split}")
+    fig = Figure(figsize=(11, 4.5), layout="constrained")
+    FigureCanvasAgg(fig)
+    for ax, metric in zip(fig.subplots(1, 2), ("loss", "accuracy")):
+        for mode in modes:
+            points = [row for row in learning if row["mode"] == mode]
+            for split, style in (("train", "--"), ("validation", "-")):
+                ax.plot([p["epoch"] for p in points], [p[f"{split}_{metric}"] for p in points], style,
+                        marker="o", markersize=3, color=colors[mode], label=f"{mode} {split}")
+        ax.set(xlabel="Epoch", ylabel=metric, title=f"{reference['view']} · {metric}")
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.grid(alpha=.2)
+        ax.legend(frameon=False, fontsize=8)
+    save(fig, "learning_curves")
+    document = ('<!doctype html><html lang="en"><meta charset="utf-8"><title>FlowyForge transfer comparison</title>'
+                '<style>body{font:15px system-ui;margin:30px}.table-wrap{overflow:auto}table{border-collapse:collapse}'
+                'td,th{padding:8px;border:1px solid #ccc;text-align:left}img{max-width:100%}</style>'
+                '<h1>Scratch / linear probe / fine-tuning</h1>'
+                '<p>Same events, splits, input contract, task, signal and optimization protocol verified. '
+                'All heads are strictly linear. Encoder initialization and freezing intentionally differ. '
+                'Test is excluded from checkpoint selection and must not guide tuning. '
+                'Unweighted single-seed results do not establish statistical significance. '
+                'Efficiency is an empirical ROC operating point, not a calibrated deployment threshold. '
+                'Unavailable efficiency means insufficient background resolution. '
+                'Throughput includes data I/O and excludes pretraining; compare timing only on comparable hardware.</p>'
+                + _table(rows, list(rows[0]))
+                + ''.join(f'<h2>{html.escape(stem)}</h2><img src="data:image/png;base64,{data}" alt="{stem}">' for stem, data in images)
+                + '</html>')
     (output / "comparison.html").write_text(document, encoding="utf-8")
     return comparison
 
@@ -522,6 +735,10 @@ def write_classification_report(metrics: dict[str, Any], output_dir: str | Path)
                     ax.grid(axis="x", alpha=0.18)
                     ax.set_axisbelow(True)
                     save(fig, "data_diagnostics" if key == "diagnostics" else "preflight_audit", title)
+
+    for key in ("downstream", "performance"):
+        if metrics.get(key):
+            table(key, key.title(), _flatten(metrics[key]), ["quantity", "value"])
 
     metadata = [{"quantity": key, "value": metrics[key]} for key in
                 ("view", "device", "seed", "best_epoch", "initialization") if key in metrics]

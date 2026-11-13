@@ -133,6 +133,57 @@ feature e collection. Il percorso globale riceve gradienti dalla ricostruzione.
 Il trainer salva lo stato completo per resume e un `encoder.pt` indipendente,
 scelto sulla validation. Nessuna lettura del test per loss o stime delle costanti.
 
+### Diagnostica riproducibile del pretraining
+
+`analysis/pretraining_report.py::generate_pretraining_report(run_dir, ...)` è
+richiamato dopo l'ultima epoca da `run_pretraining`; la CLI indipendente è
+`scripts/report_pretraining.py --run-dir RUN_DIR`. Produce
+`RUN_DIR/pretraining_report/pretraining_report.html`, PNG/PDF, CSV e Parquet.
+`--history-only` legge solo metriche/history/configurazione; `--max-events N`
+limita l'inferenza sulla validation. Opzioni e comandi completi nel
+[README](../README.md#report-scientifico-del-masked-pretraining).
+
+Il checkpoint v1 è esteso con campi opzionali `best_model_state_dict` e
+`best_model_epoch`. `model_state_dict` rimane lo stato finale per il resume;
+`best_encoder_state_dict` e l'export trasferibile restano invariati. I nuovi
+campi sono aggiornati insieme, soltanto quando migliora la loss di validation.
+Il loader diagnostico verifica che la porzione encoder del best completo
+coincida esattamente con il best encoder e con l'export, se disponibile.
+Un checkpoint legacy finale è utilizzabile per ricostruzione soltanto quando
+`epoch == best_epoch`. Negli altri casi l'assenza del decoder selezionato è
+irrecuperabile: si producono solo curve storiche con motivazione esplicita.
+
+Il campionamento sceglie i più piccoli hash `SHA256(report-v1|seed|event_id)`
+fra gli ID validation del manifest. I batch passano per lo stesso reader e
+`MaskedModelingTask.prepare_batch(validation=True)`; solo maschere vere e
+validità originale consentono la scrittura di target. La provenance per
+oggetto include `object_indices` prima di sort/troncamento. I decoder ricevono
+esclusivamente gli input corrotti. Per gli embedding si esegue un distinto
+forward sugli input puliti, in eval, senza usare etichette nella diagnostica.
+
+L'inferenza è CPU/worker 0; una copia del modello ripristinata strict non può
+modificare il modello del trainer. Il contesto preserva RNG CPU e thread.
+Le opzioni `reporting` sono escluse dal protocollo di resume; le metriche
+diagnostiche non entrano nella selezione del checkpoint. Un errore del report
+non invalida un training già scritto e viene segnalato al chiamante.
+
+La scrittura Parquet avviene per batch. Gli istogrammi e i momenti per bin si
+accumulano rileggendo blocchi scalari da 4096 righe. La covarianza degli embedding
+usa momenti centrati combinabili, con memoria O(D²), escludendo eventi vuoti e
+non finiti. I manifest conservano la stessa occupazione O(N) di ID/provenienza
+del runner; non si memorizzano tensori di tutti gli eventi. Un report viene
+preparato in una directory temporanea e pubblicato solo dopo le verifiche;
+`--overwrite` sostituisce solo i file generati in una directory di report.
+
+`bias = mean(predicted−true)` e `resolution = std(predicted−true, ddof=1)`
+sono calcolati in bin di true PT o massa; le versioni relative escludono true=0.
+Statistiche sotto la soglia configurata restano null. Il report distingue
+unità log1p da GeV dopo clipping; l'inversione della costante non equivale alla
+media fisica. Rango effettivo e varianze non sono criteri automatici di collasso:
+dipendono dalla dimensione del campione. `tests/test_pretraining_report.py`
+verifica selezione coerente encoder/decoder, compatibilità legacy, maschere,
+provenienza, riproducibilità, casi vuoti/nulli e protezione degli output.
+
 Configurazione, comandi CPU/CUDA/MPS, ripresa, contratto di caricamento e limiti
 sono documentati nel [README](../README.md#pretraining-con-masking-encoder-trasferibile-fullreco-e-l1t-separati).
 

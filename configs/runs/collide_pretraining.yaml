@@ -50,3 +50,11 @@ pretraining:
     - log1p_PT
   collection_weights: {}
   feature_weights: {}
+# Post-training validation diagnostics; never part of checkpoint selection/resume protocol.
+reporting:
+  inference: true
+  max_events: 512
+  batch_size: 16
+  seed: 2718
+  bins: 24
+  min_bin_count: 20

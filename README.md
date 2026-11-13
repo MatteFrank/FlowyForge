@@ -885,6 +885,7 @@ Ogni directory contiene:
 
 - `checkpoint.pt`: stato dell'ultima epoca completata, encoder e decoder,
   optimizer, RNG, generatori dei loader, epoca, history, migliore encoder,
+  **migliore modello completo** (encoder + decoder della stessa epoca),
   configurazione, contratto e fingerprint dei manifest;
 - `encoder.pt`: **solo tokenizer e Perceiver della migliore epoca di validation**,
   insieme a contratto e provenienza; nessun decoder o classification head;
@@ -907,7 +908,8 @@ python scripts/run_pretraining.py --config configs/runs/collide_pretraining.yaml
 python scripts/run_pretraining.py --config configs/runs/collide_pretraining.yaml --view L1T --output-dir outputs/perceiver/pretraining_l1t --resume outputs/perceiver/pretraining_l1t/checkpoint.pt --epochs 6
 ```
 
-La ripresa ammette solo variazioni di orizzonte epoche e device; non permette
+La ripresa ammette variazioni di orizzonte epoche, device e opzioni diagnostiche
+`reporting` (che non entrano nel protocollo di ottimizzazione); non permette
 cambi di batch size, maschere, reader, partizioni o dati. Non riprende a metà
 batch/epoca. La riproducibilità esatta è verificata su CPU nello stesso ambiente;
 cambiare hardware o versioni delle librerie non garantisce gli stessi bit.
@@ -946,6 +948,172 @@ troncamento. `encode(batch)` conserva l'interfaccia precedente.
 La configurazione del riferimento supervisionato del passo 3 continua a
 inizializzare da zero. Il workflow downstream descritto sotto attiva esplicitamente
 il caricamento dell'encoder, senza modificare il riferimento precedente.
+
+### Report scientifico del masked pretraining
+
+Ogni esecuzione completata di `run_pretraining.py --stage train`, incluso il
+resume, genera automaticamente **`RUN_DIR/pretraining_report/pretraining_report.html`**.
+Il modulo riutilizzabile è `flowyforge.analysis.pretraining_report`; non cambia
+loss, maschere di training, optimizer, selezione o formato di `encoder.pt`.
+Il report viene prodotto dopo il training, su CPU, con un modello separato in
+`eval()` e `inference_mode()`, preservando RNG e numero di thread del chiamante.
+`--stage inspect` continua a produrre solo il preflight: non ha un modello
+allenato da diagnosticare. Un errore di reporting segnala un warning senza
+invalidare il training già salvato; la CLI seguente consente di riprovare.
+
+Per generare un report dagli output esistenti, dalla radice con la venv attiva
+su Linux/macOS/Windows/HPC (nessun browser o display necessario sul nodo):
+
+```text
+python scripts/report_pretraining.py --run-dir outputs/perceiver/pretraining_fullreco --max-events 512
+python scripts/report_pretraining.py --run-dir outputs/perceiver/pretraining_l1t --max-events 512
+```
+
+Se il report automatico esiste già, aggiungere **`--overwrite`**, oppure scegliere
+una nuova directory, ad esempio `--output-dir outputs/perceiver/diagnostics_fullreco`.
+La sovrascrittura è ammessa solo in una directory identificata come report;
+non elimina checkpoint, dati o altri output. L'aggiornamento automatico al termine
+del resume sostituisce i file del report. I file eventualmente rimasti da un
+report precedente non sono elencati nell'HTML corrente: usare il suo indice.
+Aprire l'HTML localmente, oppure copiare **l'intera cartella** dal cluster per
+conservare figure e collegamenti.
+
+Le impostazioni di default sono nella sezione `reporting` dello YAML comune a
+FullReco/L1T. Le opzioni CLI sovrascrivono quelle salvate nel run **soltanto per
+quel report**, senza riscrivere la configurazione di training:
+
+| YAML `reporting` | CLI report | Default e significato |
+| --- | --- | --- |
+| `inference` | `--history-only` la disabilita | `true`; `false` genera solo curve e conteggi storici, senza leggere checkpoint o dati |
+| `max_events` | `--max-events N` | `512`; massimo numero di eventi validation, non di oggetti/target; intero positivo |
+| `batch_size` | `--batch-size N` | `16`; batch di inferenza CPU, worker 0, indipendente dal batch di training |
+| `seed` | `--seed N` | `2718`; seed della selezione del sottocampione, distinto dal seed delle maschere salvato nel task |
+| `bins` | `--bins N` | `24`; almeno 2, per istogrammi e curve di bias/risoluzione |
+| `min_bin_count` | `--min-bin-count N` | `20`; almeno 2 target validi per stimare bias e deviazione standard in un bin |
+
+Esempi di report più ampio e di consultazione senza sorgenti accessibili:
+
+```text
+python scripts/report_pretraining.py --run-dir outputs/perceiver/pretraining_fullreco --max-events 2000 --batch-size 8 --bins 20 --min-bin-count 30 --output-dir outputs/perceiver/diagnostics_fullreco_2000
+python scripts/report_pretraining.py --run-dir outputs/perceiver/pretraining_l1t --history-only --output-dir outputs/perceiver/diagnostics_l1t_history
+```
+
+La selezione prende i primi `max_events` ID ordinati per
+`SHA256(report-v1|seed|event_id)` nello **split validation** delle partizioni
+salvate. Non dipende dalla vista, dalle etichette, dall'ordine dei batch o dai
+valori fisici. Include tutti gli eventi se il cap supera la dimensione dello
+split; non forza un bilanciamento fra processi. Le maschere riusano esattamente
+`MaskedModelingTask.prepare_batch(validation=True)` e il seed originale del
+pretraining: cambiare il seed del report cambia gli eventi scelti, non la
+maschera di uno stesso evento. Il loader legge solo la validation selezionata
+e usa il reader originale, inclusi clipping, troncamento e validità. Non legge
+eventi test per inferenza; i controlli di integrità possono leggere byte di file
+che contengono anche altre partizioni. Il campione eredita la selezione dei file
+del pilot: **non è un campione uniforme dell'intero COLLIDE**.
+
+Il report contiene:
+
+- **Loss vs epoca:** Huber train/validation, con la costante stimata sul training
+  e valutata sugli stessi target della validation. La loss train usa maschere
+  variabili e pesi aggiornati durante l'epoca; non è direttamente equivalente
+  a una valutazione finale train in `eval()`.
+- **Heatmap per collection/feature:** `(Huber_costante − Huber_modello) /
+  Huber_costante` sulla validation per ogni epoca. Positivo indica miglioramento;
+  costante zero, valore mancante o nessun target danno una cella non disponibile.
+  Questa quantità relativa è distinta dal miglioramento assoluto in `metrics.json`.
+- **Conteggi:** target mascherati per feature/epoca, eventi vuoti, batch saltati e
+  passi optimizer nei CSV. Il report conta separatamente i batch del sottocampione
+  senza target mascherati: dipendono dal batch size di inferenza.
+- **Ricostruzione:** istogrammi 2D predicted/true e distribuzioni true/predicted/
+  baseline per ogni feature con target disponibili. Tutti usano soltanto valori
+  effettivamente mascherati e originariamente validi; non includono padding.
+- **Bias e risoluzione vs true PT/massa jet:** media del residuo `predicted − true`
+  e deviazione standard campionaria del residuo (denominatore `N−1`), sia in GeV
+  sia relativa dividendo per `true > 0`, anche per la baseline. I bin in true
+  sono uniformi in `log1p(true_GeV)`. Un vero zero rimane nella diagnostica
+  assoluta, ma non in quella relativa. Bin vuoti o sotto `min_bin_count` hanno
+  statistiche `null`/celle CSV vuote; la soglia non è un intervallo di confidenza.
+- **Embedding:** spettro della covarianza centrata, media e varianza per dimensione,
+  varianza totale e rango effettivo entropico. Si usa l'encoder selezionato su input
+  **non mascherati**, escludendo eventi vuoti o embedding non finiti dalla covarianza.
+  Il rango massimo è `min(N−1, dimensione)`; un campione piccolo non dimostra
+  collasso. Con meno di due eventi idonei la stima è esplicitamente indisponibile.
+
+I pannelli e le colonne separano `*_transformed` da `*_GeV`. I valori fisici sono
+`expm1(log1p_PT/Mass)` dopo conversione e clipping del reader: non recuperano i
+valori originari prima del clipping. La baseline fisica è `expm1(media log1p sul
+train)`, non la media dei PT/massa fisici e neppure l'ottimo costante della Huber.
+Predizioni negative non vengono corrette artificialmente; sono conteggiate.
+NaN/inf e overflow dell'inversa sono salvati come null ed esclusi dai relativi
+istogrammi, con conteggi espliciti. Target della stessa particella/evento possono
+essere correlati: i conteggi dei bin non sono numeri di eventi indipendenti.
+Le loss del sottocampione possono differire dalla validation completa registrata
+nelle curve; il report non modifica la scelta del checkpoint.
+
+```text
+RUN_DIR/pretraining_report/
+  pretraining_report.html          # figure, metriche, limiti, configurazione, link
+  report.json                     # fingerprint, epoca, campionamento, conteggi/stati
+  resolved_config.yaml
+  history.csv                     # loss, target totali, batch/eventi/optimizer
+  feature_history.csv             # Huber, baseline e miglioramento per feature/epoca
+  sample_events.csv               # ID di tutti gli eventi inferiti, anche vuoti
+  predictions.parquet             # solo target mascherati: ID, vista, split, epoca,
+                                  # collection/feature, indice originale e slot oggetto,
+                                  # true/predicted/baseline trasformati e in GeV
+  embeddings.parquet              # ID, split, empty, embedding non mascherato
+  histograms.csv
+  bias_resolution.csv
+  embedding_spectrum.csv
+  embedding_variance.csv
+  *.png / *.pdf                   # loss, heatmap, conteggi, ricostruzioni, embedding
+```
+
+Gli artefatti di inferenza non vengono creati nei report solo storici; i CSV dello
+spettro richiedono almeno due embedding idonei. Le predizioni vengono scritte
+per batch in Parquet e rilette in blocchi per istogrammi e statistiche; non si
+accumulano gli oggetti dell'intero campione. La covarianza richiede memoria
+`O(dimensione_embedding²)`. I manifest originali e i loro ID scalari restano in
+memoria come nel runner. Dimensioni di batch/reader e limiti degli oggetti
+controllano la memoria dei tensori. Per aumentare `max_events` non serve cambiare
+codice; costo di inferenza e dimensione del Parquet aumentano con il campione.
+
+**Compatibilità dei checkpoint:** il checkpoint v1 aggiunge i campi opzionali
+`best_model_state_dict` e `best_model_epoch`, senza cambiare i campi legacy o
+l'export trasferibile. Il report controlla epoca, contratto, history, fingerprint
+dei manifest e uguaglianza esatta dell'encoder selezionato con `encoder.pt` se
+presente. Per checkpoint precedenti può usare il modello completo finale solo
+se `epoch == best_epoch` e i pesi encoder coincidono. Se la migliore epoca è
+precedente e manca il suo decoder, genera un report storico con stato
+`unavailable`: non inventa il decoder e non associa pesi di epoche diverse.
+Il resume legacy resta supportato; il best completo viene salvato al successivo
+miglioramento, oppure recuperato subito se l'ultima epoca era la migliore.
+Incompatibilità o dati modificati generano un errore esplicito; per consultare
+le sole curve con dati non più accessibili usare `--history-only`.
+
+La riproducibilità riguarda identità e maschere esatte nello stesso protocollo;
+le predizioni numeriche possono differire lievemente cambiando batch size o
+versione di PyTorch. Nessuna di queste diagnostiche usa il test per tuning,
+misura il transfer downstream o certifica prestazioni fisiche.
+
+Verifica del report completata il **13 novembre 2026**: `python3 -m pytest tests/ -q`
+ha passato **115 test**, inclusi smoke CPU con dati sintetici, selezione della
+migliore epoca diversa dall'ultima, report automatico, checkpoint legacy,
+predizioni riproducibili, invalidi/padding/zeri ed eventi vuoti. Rimangono warning
+di deprecazione Matplotlib/Pillow nella generazione dei PDF. Sono stati generati
+e controllati anche i report dei due smoke sintetici preesistenti:
+
+```text
+python scripts/report_pretraining.py --run-dir outputs/perceiver/pretraining_smoke/fullreco --max-events 8 --bins 8 --min-bin-count 2 --overwrite
+python scripts/report_pretraining.py --run-dir outputs/perceiver/pretraining_smoke/l1t --max-events 8 --bins 8 --min-bin-count 2 --overwrite
+```
+
+In questi checkpoint legacy l'ultima epoca coincide con la migliore e consente
+di verificare encoder/decoder. Gli HTML sono nelle rispettive sottodirectory
+`pretraining_report/`. La soglia 2 è usata qui soltanto per esercitare i bin del
+report su campioni minuscoli; non è una soglia scientifica consigliata.
+Non è stato avviato il training del pilot reale, né sono state misurate
+prestazioni fisiche o modificato il benchmark downstream in questo intervento.
 
 ### Smoke offline riproducibile
 

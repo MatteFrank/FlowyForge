@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 import random
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +28,8 @@ from flowyforge.training.classification_run import (
 def load_pretraining_config(path, overrides=None):
     path = Path(path).expanduser().resolve()
     raw = load_yaml(path)
+    from flowyforge.analysis.pretraining_report import report_options
+    reporting = report_options(raw.pop("reporting", {}))
     masking = {"probability": 0.15, "seed": 12345, "huber_delta": 1.0, "decoder_hidden_dim": 64,
                "targets": None, "collection_weights": {}, "feature_weights": {}, **raw.pop("pretraining", {})}
     _known(masking, {"probability", "seed", "huber_delta", "decoder_hidden_dim", "targets",
@@ -37,6 +40,7 @@ def load_pretraining_config(path, overrides=None):
         raise ValueError("Pretraining requires the shared partition_manifest; create it with run_classification.py --stage partitions.")
     config.pop("evaluation")  # Supervised evaluation settings have no role in masking.
     config["pretraining"] = masking
+    config["reporting"] = reporting
     task = _task(config)
     config["pretraining"]["targets"] = task.targets
     return config
@@ -139,6 +143,7 @@ def _epoch(model, loader, task, device, *, epoch, baseline, optimizer=None, grad
 
 def _resume_protocol(config):
     protocol = copy.deepcopy(config)
+    protocol.pop("reporting", None)  # Diagnostics never affect optimization or resume compatibility.
     for key in ("config_path", "model_config_path", "output_dir"):
         protocol.pop(key)
     # Epoch-boundary resume; only extend the horizon or change runtime device.
@@ -237,6 +242,7 @@ def run_pretraining(config, *, inspect_only=False, resume=None):
         return preflight
 
     history, best_loss, best_epoch, best_state, start = [], math.inf, 0, None, 0
+    best_model_state = None
     if saved:
         try:
             model.load_state_dict(saved["model_state_dict"], strict=True)
@@ -245,6 +251,8 @@ def run_pretraining(config, *, inspect_only=False, resume=None):
             raise ValueError(f"Incompatible pretraining model/optimizer state: {exc}") from exc
         history, best_loss, best_epoch = saved["history"], saved["best_loss"], saved["best_epoch"]
         best_state, start = saved["best_encoder_state_dict"], saved["epoch"]
+        from flowyforge.analysis.pretraining_report import selected_model_state
+        best_model_state, _ = selected_model_state(saved)
         _restore_rng(saved["rng"], device, loaders)
     for epoch in range(start + 1, settings["epochs"] + 1):
         loaders["train"].dataset.set_epoch(epoch)
@@ -259,9 +267,12 @@ def run_pretraining(config, *, inspect_only=False, resume=None):
         if validation["loss"] < best_loss:
             best_loss, best_epoch = validation["loss"], epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.encoder.state_dict().items()}
+            best_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         checkpoint = {"kind": "flowyforge.masked_pretraining", "version": 1, "epoch": epoch,
                       "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
                       "best_encoder_state_dict": best_state, "best_epoch": best_epoch, "best_loss": best_loss,
+                      "best_model_state_dict": best_model_state,
+                      "best_model_epoch": best_epoch if best_model_state is not None else None,
                       "history": history, "constant_baseline": baseline, "contract": contract,
                       "config": config, "protocol": _resume_protocol(config), "dataset_sha256": digest,
                       "partition_sha256": partitions["sha256"], "rng": _rng_state(device, loaders)}
@@ -282,4 +293,14 @@ def run_pretraining(config, *, inspect_only=False, resume=None):
         _write_json(output / "metrics.json", metrics)
         print(f"Epoch {epoch}: train Huber={training['loss']:.6g}, validation={validation['loss']:.6g}, "
               f"training constant={validation['training_constant']['loss']:.6g}; best={best_epoch}", flush=True)
+    # Reporting is post-training, uses a separate model, and cannot change selection/resume.
+    from flowyforge.analysis.pretraining_report import generate_pretraining_report
+    try:
+        report = generate_pretraining_report(output, options=config.get("reporting"), overwrite=True)
+        print(f"Pretraining diagnostics: {report['html']}", flush=True)
+        if report["inference"].get("reason"):
+            print(f"Diagnostic limitation: {report['inference']['reason']}", flush=True)
+    except (ValueError, TypeError, KeyError, OSError, RuntimeError, ImportError, FloatingPointError) as exc:
+        warnings.warn(f"Training saved successfully; pretraining report failed: {exc}. "
+                      "Retry scripts/report_pretraining.py on this run.", RuntimeWarning)
     return metrics

@@ -25,13 +25,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-events-per-class", type=int, help="Uniform per-class sample cap; 0 means all events.")
     parser.add_argument("--view", choices=("FullReco", "L1T"))
     parser.add_argument("--model-config", help="Model YAML; CLI paths are relative to the working directory.")
-    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--epochs", type=int, help="Total training horizon, including epochs already completed before --resume.")
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--device", help="auto, cpu, cuda, cuda:0, or mps")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--output-dir")
     parser.add_argument("--checkpoint", help="For evaluate; default checkpoint.pt in the training output configured in YAML.")
+    parser.add_argument("--resume", help="For train: last_checkpoint.pt in the same output directory. --epochs is the TOTAL horizon.")
     return parser.parse_args()
 
 
@@ -40,6 +41,8 @@ def main() -> int:
     from flowyforge.core.config import load_yaml
 
     try:
+        if args.resume and args.stage != "train":
+            raise ValueError("--resume is only supported with --stage train.")
         if args.stage in {"compare", "compare-transfer"}:
             from flowyforge.analysis.classification_report import compare_classification_runs, compare_downstream_runs
 
@@ -83,7 +86,7 @@ def main() -> int:
             if args.checkpoint:
                 raise ValueError("--checkpoint is only used by --stage evaluate.")
             overrides = {key: value for key, value in vars(args).items()
-                         if value is not None and key not in {"config", "stage", "process", "process_name", "checkpoint", "run_dir"}}
+                         if value is not None and key not in {"config", "stage", "process", "process_name", "checkpoint", "run_dir", "resume"}}
             if args.process_name is not None:
                 overrides["process_names"] = args.process_name
             if args.process:
@@ -110,7 +113,7 @@ def main() -> int:
                 save_partition_manifest(partitions, target)
                 print(f"Partitions: {target}; counts: {partitions['split_counts']}; SHA256: {partitions['sha256']}")
                 return 0
-            metrics = run_classification(config, inspect_only=args.stage == "inspect")
+            metrics = run_classification(config, inspect_only=args.stage == "inspect", resume=args.resume)
             output = Path(config["output_dir"])
         if args.stage == "inspect":
             print(f"Preflight complete: {output / 'preflight.json'}")

@@ -627,7 +627,8 @@ Si possono cambiare device, batch size o numero di worker di **valutazione**;
 il protocollo di training originale resta registrato. Per dati spostati aggiungere
 `--data-root NUOVA_RADICE` secondo la procedura del passo 2. Le directory con score
 esistenti non vengono sovrascritte: per un'altra valutazione scegliere un nuovo
-`--output-dir`. Il runner supervisionato non implementa il resume del training.
+`--output-dir`. Per proseguire il training usare invece `--stage train --resume`
+con il nuovo `last_checkpoint.pt`, come descritto sotto.
 
 ### Score, ROC-AUC ed efficienza del segnale
 
@@ -1326,8 +1327,8 @@ score del segnale e split.
 I checkpoint downstream hanno **`format_version: 2`** e contengono encoder e
 testa completi. La valutazione non ha bisogno dell'originale `encoder.pt`, pur
 conservandone percorso, hash e provenienza. I checkpoint legacy versione 1 restano
-caricabili. Non è introdotto resume del training downstream; il resume del
-pretraining rimane disponibile separatamente.
+caricabili per valutazione. Il resume supervisionato/downstream usa il nuovo
+`last_checkpoint.pt`; il resume del pretraining mantiene la propria interfaccia.
 
 In `metrics.json`, la sezione `downstream` registra modalità, freezing, origine
 dell'encoder, fingerprint iniziali/selezionati e parametri totali/allenabili di
@@ -1358,6 +1359,123 @@ Servono più seed, incertezze, controllo della rappresentatività del campione e
 una procedura di tuning fissata sulla validation per conclusioni scientifiche.
 Non sono introdotti pesi di luminosità/cross-section, deduplicazione fisica fra
 sorgenti, Graph, MoE o allineamento fra viste.
+
+### Riprendere il training di classificazione con `--resume`
+
+Lo stesso runner supporta ora **legacy supervised (testa MLP), scratch, linear
+probe e fine-tuning**. `--resume PATH` è ammesso solo con `--stage train`, nella
+stessa directory di output. Non ricrea gli split e non reinizializza i pesi
+allenati. `--epochs N` indica il **totale**: salvata l'epoca 8, `--epochs 20`
+esegue le epoche **9–20**. Non è possibile ridurre l'orizzonte già configurato.
+
+| Checkpoint di classificazione | Utilizzo |
+| --- | --- |
+| `checkpoint.pt` | Miglior modello secondo la minima loss di validation; encoder e testa completi. Rimane `format_version=1` per legacy, `2` per downstream. Usato da `evaluate`, `compare` e `compare-transfer` |
+| `last_checkpoint.pt` | Stato dell'ultima epoca completata: pesi correnti, AdamW, RNG, generatori DataLoader, history, migliore epoca/loss, copia coerente del best, provenienza, contratto, configurazione e fingerprint. Tipo `flowyforge.classification_resume`, versione 1 |
+
+I nuovi training salvano entrambi automaticamente. **I run prodotti dal vecchio
+runner, con solo `checkpoint.pt`, non possono riprendere esattamente:** mancano
+optimizer e RNG. Restano valutabili; non viene inventato uno stato di optimizer
+né presentato un caricamento dei soli pesi come resume.
+
+Esempi dalla radice con venv attiva su macOS/Linux/Windows/HPC. Presuppongono
+training avviati con questa versione, stesse impostazioni YAML/CLI e stesso
+ambiente. Per un linear probe FullReco già arrivato, ad esempio, a 8 epoche:
+
+```text
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage train --view FullReco --downstream-mode linear_probe --encoder-checkpoint outputs/perceiver/pretraining_fullreco/encoder.pt --resume outputs/perceiver/downstream_fullreco_linear_probe/last_checkpoint.pt --epochs 20 --output-dir outputs/perceiver/downstream_fullreco_linear_probe
+```
+
+Per un fine-tuning L1T:
+
+```text
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage train --view L1T --downstream-mode finetune --encoder-checkpoint outputs/perceiver/pretraining_l1t/encoder.pt --resume outputs/perceiver/downstream_l1t_finetune/last_checkpoint.pt --epochs 20 --output-dir outputs/perceiver/downstream_l1t_finetune
+```
+
+Per scratch e riferimento legacy, mantenendo le rispettive teste:
+
+```text
+python scripts/run_classification.py --config configs/runs/collide_downstream.yaml --stage train --view FullReco --downstream-mode scratch --resume outputs/perceiver/downstream_fullreco_scratch/last_checkpoint.pt --epochs 20 --output-dir outputs/perceiver/downstream_fullreco_scratch
+python scripts/run_classification.py --config configs/runs/collide_supervised.yaml --stage train --view L1T --resume outputs/perceiver/supervised_l1t/last_checkpoint.pt --epochs 20 --output-dir outputs/perceiver/supervised_l1t
+```
+
+Per le altre combinazioni scegliere la vista e la directory del run originale:
+non si può riprendere FullReco come L1T. Ripetere gli eventuali override originali
+(`--device cpu`, `--batch-size`, sorgenti, modello ecc.). La CLI accetta anche
+`--resume RUN_DIR/checkpoint.pt` **come alias del fratello `last_checkpoint.pt`**:
+se quest'ultimo manca, restituisce un errore. `--checkpoint` rimane invece
+riservato alla valutazione.
+
+Il resume verifica prima di modificare gli output: modalità/testa/freezing,
+contratto delle feature e architettura, etichette, inventario e SHA256 dei dati,
+partizioni correnti e salvate, protocollo, integrità dello stato, history,
+optimizer e RNG. È consentito cambiare solo il totale di epoche fra i parametri
+del run; anche batch size, worker, seed, device, shuffle buffer e thread devono
+rimanere invariati. Sono controllati device effettivo e versioni Python/NumPy/
+PyTorch/piattaforma. Il resume richiede gli stessi percorsi/binding dei dati;
+la rilocazione per `evaluate --data-root` rimane separata. Se una verifica fallisce
+gli artefatti precedenti non vengono sostituiti.
+
+Nel **linear probe**, l'encoder ripristinato rimane congelato e in eval anche
+durante `model.train()`, e AdamW contiene solo i parametri allenabili della testa.
+Il fingerprint dell'encoder è verificato dopo la ripresa e a ogni epoca.
+Nel **fine-tuning**, i pesi ripartono dallo stato downstream dell'ultima epoca;
+non vengono ricaricati dall'encoder di pretraining. La provenance originale
+rimane registrata. Il file `encoder.pt` originale non è necessario per il
+resume; se è ancora presente nello stesso percorso, il suo hash deve coincidere.
+
+**Interruzioni:** si riparte dall'epoca successiva all'ultima completamente
+salvata, dopo train e validation. Il lavoro di un'epoca interrotta viene rieseguito
+per intero; non si salva la posizione a metà batch. Il salvataggio atomico di
+`last_checkpoint.pt` precede la pubblicazione di best e history: la copia del best
+al suo interno permette di recuperare un `checkpoint.pt` mancante o rimasto
+all'epoca precedente. Checkpoint incompatibili/corrotti sono rifiutati.
+Se l'interruzione è avvenuta nella valutazione finale, si può ripetere il comando
+con lo stesso `--epochs` già raggiunto: vengono rigenerate soltanto valutazione
+e presentazione, senza aggiornamenti di optimizer. Se nessuna epoca è stata
+completata, non esiste ancora uno stato riprendibile.
+
+Prima della ripresa gli score/report precedenti, anche parziali, sono conservati
+in `RUN_DIR/resume_archive/run-*/`, insieme a copie dei checkpoint e manifest:
+non vengono cancellati dataset né risultati precedenti. Al termine il runner
+ricrea `scores/validation/`, `scores/test/`, `metrics.json` e `report.html` nella
+struttura abituale, valutando **il best**, che può essere precedente al resume.
+Lo stato in `last_checkpoint.pt` resta quello finale, anche quando è peggiore.
+Le copie di modello/optimizer e gli archivi richiedono ulteriore spazio su disco.
+
+`training_run` nei checkpoint, nelle metriche e nel report registra training
+originale/resumed, epoca iniziale/finale dell'invocazione, totale completato,
+epoche eseguite nell'invocazione, sorgente e SHA256 del resume, elenco delle
+sessioni e limiti di riproducibilità. History e durata train aggregata continuano
+invece dalla prima epoca; i tempi non comprendono il lavoro perso di un'epoca
+interrotta. Il best mantiene i suoi pesi e la sua epoca, aggiornando i metadati
+del protocollo all'orizzonte esteso. Per questo `compare-transfer` può confrontare
+run continui e ripresi con lo stesso numero totale di epoche e gli stessi eventi.
+
+La selezione continua a dipendere **solo dalla validation**. Il loader test viene
+costruito dopo tutte le epoche richieste; non entra nello stato usato per allenare
+o scegliere il best. Estendere un run già completato non deve essere una decisione
+presa in base al suo precedente risultato sul test. Fissare il budget mediante
+protocollo/validation, quindi usare il test per la valutazione finale.
+
+La riproducibilità esatta di pesi, optimizer, RNG e metriche (esclusi tempi e
+throughput) è verificata su **CPU, `num_workers=0`, stesso ambiente e hardware**.
+Con worker attivi i processi vengono ricreati a ogni epoca; ripristiniamo i
+generatori dei loader e `dataset.set_epoch(epoch)`, non i buffer prefetched di
+un'epoca interrotta. Non si promette identità bit a bit con worker multipli,
+CUDA/MPS, altro hardware o versioni differenti. Nessuna modifica a reader,
+feature fisiche, split o cross-entropy è necessaria per il resume.
+
+Verifiche del resume eseguite il **13 novembre 2026**: `python3 -m pytest tests/ -q`
+→ **142 test passati**. I 27 nuovi casi usano Parquet sintetici e CPU: tutte e
+quattro le modalità, confronto esatto 3 epoche continue contro 1 + resume a 3,
+optimizer e RNG ripristinati, freezing, interruzione a metà epoca e fra le
+scritture dei checkpoint, recupero della valutazione finale, file modificati,
+stati corrotti/incompleti, CLI L1T e compatibilità dei report/comparatori.
+Uno smoke con `num_workers=1` verifica il riavvio dei worker e i conteggi degli
+split; non costituisce una garanzia di replay bit a bit con più worker.
+Nessun training sul pilot reale né prova CUDA/MPS è stato avviato. Rimangono
+warning di deprecazione Matplotlib/Pillow nella produzione dei PDF.
 
 ### Verifiche downstream effettivamente eseguite
 
@@ -1439,15 +1557,16 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('MPS:'
 ```
 
 Ogni training supervisionato salva `resolved_config.yaml`, `dataset_manifest.json`,
-`preflight.json`, `checkpoint.pt`, `history.json`, `metrics.json`, `report.html`,
+`preflight.json`, `checkpoint.pt`, `last_checkpoint.pt`, `history.json`, `metrics.json`, `report.html`,
 `tables/` e `plots/` (CSV, PNG/PDF). Aprire `report.html` con un browser; il report
 non richiede un server. Conservare i file del run insieme e mantenere accessibili
 i Parquet per `evaluate`. I run con partizioni condivise salvano anche
 `partitions.json` e permettono la rilocazione verificata tramite `--data-root`;
 i manifest legacy versione 1 conservano i percorsi originali.
 
-Il checkpoint supervisionato è per inferenza/valutazione, senza resume; il
-pretraining ha un checkpoint riprendibile separato, come descritto sopra. Training su
+Il best `checkpoint.pt` supervisionato rimane per inferenza/valutazione;
+`last_checkpoint.pt` serve al resume. Il pretraining mantiene il proprio checkpoint
+riprendibile, come descritto sopra. Training su
 un singolo device, niente DDP o pesi fisici; split per riga, senza deduplicazione
 di eventi fisici tra file. Accuracy/F1 su campioni piccoli non sono un benchmark.
 Schema, unità e prestazioni reali COLLIDE-V2 richiedono una validazione sul sito.

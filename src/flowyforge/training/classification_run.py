@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import errno
+import copy
 import hashlib
 import json
 import math
 import os
 import random
+import pickle
+import platform
+import shutil
+import tempfile
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -34,6 +39,7 @@ from flowyforge.data_plugins.collide_v2.streaming import (
 )
 from flowyforge.model_plugins import EventClassificationModel, FoundationEncoder, PerceiverConfig
 from flowyforge.model_plugins.foundation_encoder import encoder_contract
+from flowyforge.training.checkpointing import _rng_state, _restore_rng, _save_checkpoint, state_digest
 
 
 def _known(mapping: Mapping[str, Any], allowed: set[str], section: str) -> None:
@@ -480,68 +486,327 @@ def _finish_diagnostics(diagnostics: dict[str, Any]) -> None:
         totals["missing_optional_event_fraction"] = totals["missing_optional_events"] / events if events else 0.0
 
 
-def run_classification(config: dict[str, Any], *, inspect_only: bool = False) -> dict[str, Any]:
-    """Preflight all file schemas, optionally train and evaluate one selected model.
+def _resume_protocol(config):
+    protocol = copy.deepcopy(config)
+    for key in ("config_path", "model_config_path", "output_dir"):
+        protocol.pop(key, None)
+    protocol["training"].pop("epochs")
+    return protocol
 
-    Checkpoints are inference artifacts. A completed or interrupted training
-    directory is protected from accidental reuse; choose a new output directory.
-    """
-    output = Path(config["output_dir"])
-    if any((output / name).exists() for name in ("checkpoint.pt", "history.json", "metrics.json", "scores")):
-        raise FileExistsError(f"Refusing to overwrite an existing run: {output}. Choose a new --output-dir.")
+
+def _classification_contract(config):
+    contract = encoder_contract(config["model"], config["data"])
+    contract["mask_indicators"] = bool(config.get("downstream"))
+    return contract
+
+
+def _load_training_state(path):
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(payload, dict):
+            raise ValueError("expected a checkpoint mapping")
+        return payload
+    except (OSError, RuntimeError, EOFError, ValueError, pickle.UnpicklingError) as exc:
+        raise ValueError(f"Unreadable/corrupt classification checkpoint {path}: {exc}") from exc
+
+
+def _read_resume(resume, output, config):
+    requested = Path(resume).expanduser().resolve()
+    # Accept the older example spelling, but NEVER treat inference weights as resume state.
+    path = requested.with_name("last_checkpoint.pt") if requested.name == "checkpoint.pt" else requested
+    if path != (output / "last_checkpoint.pt").resolve():
+        raise ValueError("Resume requires last_checkpoint.pt in the same --output-dir.")
+    if not path.is_file():
+        raise ValueError("No last_checkpoint.pt: old inference checkpoints lack optimizer/RNG state and cannot resume training.")
+    fingerprint = sha256_file(path)
+    saved = _load_training_state(path)
+    if not isinstance(saved, dict) or saved.get("kind") != "flowyforge.classification_resume" or saved.get("version") != 1:
+        raise ValueError("Expected classification last_checkpoint.pt v1 with optimizer/RNG; inference checkpoints cannot resume training.")
+    required = {"epoch", "config", "protocol", "model_state_dict", "optimizer_state_dict", "optimizer_parameters",
+                "rng", "best_checkpoint", "best_epoch", "best_loss", "history", "initial_metadata", "first_train",
+                "diagnostics", "dataset_manifest_sha256", "partition_sha256", "source_sha256", "input_contract",
+                "training_run", "runtime", "state_sha256"}
+    if required - saved.keys():
+        raise ValueError(f"Incomplete resume checkpoint: missing {sorted(required - saved.keys())}.")
+    try:
+        if saved["state_sha256"] != state_digest({k: v for k, v in saved.items() if k != "state_sha256"}):
+            raise ValueError("Resume checkpoint integrity checksum mismatch.")
+        if saved["protocol"] != _resume_protocol(saved["config"]) or saved["protocol"] != _resume_protocol(config):
+            raise ValueError("Incompatible resume configuration/protocol: only training.epochs may increase.")
+        epoch, history, best = saved["epoch"], saved["history"], saved["best_checkpoint"]
+        if (type(epoch) is not int or epoch < 1 or len(history) != epoch
+                or [h["epoch"] for h in history] != list(range(1, epoch + 1))
+                or any(not math.isfinite(h["validation"]["loss"]) for h in history)):
+            raise ValueError("Invalid/incomplete resume history or completed epoch.")
+        chosen = min(history, key=lambda h: h["validation"]["loss"])
+        if (saved["best_epoch"] != chosen["epoch"] or saved["best_loss"] != chosen["validation"]["loss"]
+                or best["best_epoch"] != saved["best_epoch"] or best["best_validation_loss"] != saved["best_loss"]
+                or best["config"] != saved["config"] or best["training_protocol"] != _training_protocol(saved["config"])
+                or best["format_version"] != (2 if config.get("downstream") else 1)):
+            raise ValueError("Resume best checkpoint is inconsistent with validation history/configuration.")
+        if config["training"]["epochs"] < max(epoch, saved["config"]["training"]["epochs"]):
+            raise ValueError("--epochs is the TOTAL horizon; it cannot shorten the saved training horizon.")
+        for key, value in saved["initial_metadata"].items():
+            if best.get(key) != value:
+                raise ValueError(f"Resume initialization/provenance mismatch: {key}.")
+        if saved["input_contract"] != _classification_contract(config):
+            raise ValueError("Incompatible classification resume architecture/input contract.")
+        if sha256_file(path) != fingerprint:
+            raise ValueError("Resume checkpoint changed while loading.")
+    except (KeyError, TypeError, AttributeError, IndexError) as exc:
+        raise ValueError(f"Malformed/incomplete resume checkpoint: {exc}") from exc
+    return saved, {"path": str(path), "sha256": fingerprint, "saved_epoch": saved["epoch"]}
+
+
+def _runtime(device):
+    return {"device": str(device), "torch": str(torch.__version__), "numpy": np.__version__,
+            "python": platform.python_version(), "platform": platform.platform(),
+            "cuda_device_count": torch.cuda.device_count() if device.type == "cuda" else 0}
+
+
+def _training_run(saved, source, start, epoch, config, runtime):
+    sessions = copy.deepcopy(saved["training_run"]["sessions"]) if saved else []
+    sessions.append({"start_epoch": start + 1, "end_epoch": epoch, "epochs_executed": epoch - start,
+                     "requested_epochs": config["training"]["epochs"], "resume_source": source})
+    return {"resumed": saved is not None, "start_epoch": start + 1, "end_epoch": epoch,
+            "epochs_completed": epoch, "epochs_this_invocation": epoch - start, "resume_source": source,
+            "sessions": sessions, "runtime": runtime,
+            "reproducibility": "Exact tensor/metric replay tested on CPU, num_workers=0, same software/hardware and config; "
+                               "timing differs. Worker processes restart at epoch boundaries; no guarantee of bitwise "
+                               "identity across accelerators, workers, library versions or hardware. No mid-epoch resume."}
+
+
+def _validate_restored_training(model, optimizer, saved, config, manifest, device, loaders):
+    """Validate all restored state before replacing any existing run artifacts."""
+    try:
+        names = [name for name, p in model.named_parameters() if p.requires_grad]
+        if names != saved["optimizer_parameters"]:
+            raise ValueError("Resume optimizer parameter names/freezing differ.")
+        state = saved["optimizer_state_dict"]
+        if len(state["param_groups"]) != 1 or not state["state"]:
+            raise ValueError("Missing or invalid AdamW optimizer state.")
+        expected = optimizer.state_dict()["param_groups"][0]
+        if state["param_groups"][0] != expected:
+            raise ValueError("Resume AdamW parameter groups/hyperparameters differ.")
+        parameters = [p for p in model.parameters() if p.requires_grad]
+        indices = state["param_groups"][0]["params"]
+        if set(state["state"]) - set(indices):
+            raise ValueError("Unknown optimizer parameter in resume state.")
+        for index, value in state["state"].items():
+            param = parameters[indices.index(index)]
+            if (not {"step", "exp_avg", "exp_avg_sq"} <= value.keys() or value["step"].numel() != 1
+                    or not torch.isfinite(value["step"]) or value["step"] < 1):
+                raise ValueError("Incomplete/nonfinite AdamW state.")
+            for key in ("exp_avg", "exp_avg_sq"):
+                if value[key].shape != param.shape or not torch.isfinite(value[key]).all():
+                    raise ValueError("Invalid AdamW moment shape/value.")
+        best = saved["best_checkpoint"]
+        model.load_state_dict(best["model_state_dict"], strict=True)
+        if any(not torch.isfinite(v).all() for v in model.state_dict().values()):
+            raise ValueError("Nonfinite best-model weights in resume checkpoint.")
+        metadata = saved["initial_metadata"].get("downstream")
+        if metadata:
+            mode = config["downstream"]["mode"]
+            if (metadata["mode"] != mode or metadata["head_type"] != "linear"
+                    or metadata["freezing"] != ("encoder_frozen_eval" if mode == "linear_probe" else "none")
+                    or metadata["parameters"] != _parameter_counts(model)
+                    or metadata["selected_encoder_sha256"] != _initial_state_digest(model.encoder)
+                    or metadata["selected_head_sha256"] != _initial_state_digest(model.head)):
+                raise ValueError("Resume downstream best weights/freezing metadata mismatch.")
+            source = metadata["encoder_source"]
+            if mode != "scratch":
+                provenance = source["provenance"]
+                if (provenance.get("partition_sha256") != manifest.get("partition_sha256")
+                        or provenance.get("test_used") is not False or provenance.get("pretraining_split") != "train"
+                        or provenance.get("checkpoint_selection_split") != "validation"):
+                    raise ValueError("Incompatible pretrained encoder provenance in resume checkpoint.")
+                original = Path(config["downstream"]["encoder_checkpoint"]).expanduser()
+                if str(original.resolve()) != source["path"] or (original.exists() and sha256_file(original) != source["sha256"]):
+                    raise ValueError("Original pretrained encoder source/fingerprint changed.")
+            elif source is not None:
+                raise ValueError("Scratch resume must not have a pretrained encoder source.")
+        model.load_state_dict(saved["model_state_dict"], strict=True)
+        if any(not torch.isfinite(v).all() for v in model.state_dict().values()):
+            raise ValueError("Nonfinite model weights in resume checkpoint.")
+        optimizer.load_state_dict(state)
+        model.train()
+        if model.freeze_encoder:
+            if (any(p.requires_grad for p in model.encoder.parameters())
+                    or any(m.training for m in model.encoder.modules())
+                    or _initial_state_digest(model.encoder) != metadata["initial_encoder_sha256"]):
+                raise ValueError("Linear probe resume changed encoder weights/freezing/eval mode.")
+        if set(saved["rng"]["loaders"]) != set(loaders):
+            raise ValueError("Incomplete DataLoader RNG state.")
+        if device.type in {"cuda", "mps"} and device.type not in saved["rng"]:
+            raise ValueError("Missing accelerator RNG state.")
+        _restore_rng(saved["rng"], device, loaders)
+    except (KeyError, TypeError, RuntimeError, IndexError, AttributeError, OverflowError) as exc:
+        raise ValueError(f"Invalid/incomplete classifier/optimizer/RNG resume state: {exc}") from exc
+
+
+def _validate_resume_binding(saved, manifest, source_hashes, output):
+    best = saved["best_checkpoint"]
+    if (saved["dataset_manifest_sha256"] != _manifest_digest(manifest)
+            or best["dataset_manifest_sha256"] != _manifest_digest(manifest)
+            or saved["partition_sha256"] != manifest.get("partition_sha256")
+            or saved["source_sha256"] != source_hashes or best["label_map"] != manifest["label_map"]):
+        raise ValueError("Resume dataset/partition manifest, source contents or label map changed.")
+    stored = json.loads((output / "dataset_manifest.json").read_text())
+    if _manifest_digest(stored) != saved["dataset_manifest_sha256"]:
+        raise ValueError("Saved resume dataset manifest was modified.")
+    if manifest.get("version") == 2 and load_partition_manifest(output / "partitions.json")["sha256"] != saved["partition_sha256"]:
+        raise ValueError("Saved resume partitions were modified.")
+    if (output / "checkpoint.pt").exists():
+        current = _load_training_state(output / "checkpoint.pt")
+        required = {"config", "model_state_dict", "best_epoch", "best_validation_loss"}
+        if required - current.keys():
+            raise ValueError("Existing best checkpoint is incomplete; cannot silently overwrite it.")
+        if (current.get("format_version") != best["format_version"]
+                or current.get("initial_state_sha256") != best["initial_state_sha256"]
+                or current.get("dataset_manifest_sha256") != saved["dataset_manifest_sha256"]
+                or _resume_protocol(current["config"]) != saved["protocol"]
+                or current.get("best_epoch", math.inf) > best["best_epoch"]):
+            raise ValueError("Existing best checkpoint is incompatible with resume state.")
+        weights, expected = current["model_state_dict"], best["model_state_dict"]
+        if (not isinstance(weights, dict) or not isinstance(expected, dict)
+                or weights.keys() != expected.keys() or any(
+                not isinstance(v, torch.Tensor) or v.shape != expected[k].shape
+                or v.dtype != expected[k].dtype or not torch.isfinite(v).all() for k, v in weights.items())):
+            raise ValueError("Existing best checkpoint has invalid model weights.")
+        epoch = current["best_epoch"]
+        if (type(epoch) is not int or epoch < 1
+                or current["best_validation_loss"] != saved["history"][epoch - 1]["validation"]["loss"]):
+            raise ValueError("Existing best checkpoint differs from saved validation history.")
+        if current["best_epoch"] == best["best_epoch"] and state_digest(current["model_state_dict"]) != state_digest(best["model_state_dict"]):
+            raise ValueError("Existing best checkpoint weights differ from the committed resume snapshot.")
+
+
+def _archive_run(output):
+    """Preserve previous/partial evaluations and scores; never delete user outputs."""
+    root = output / "resume_archive"
+    root.mkdir(exist_ok=True)
+    archive = Path(tempfile.mkdtemp(prefix="run-", dir=root))
+    for name in ("checkpoint.pt", "last_checkpoint.pt", "history.json", "resolved_config.yaml",
+                 "dataset_manifest.json", "partitions.json", "preflight.json"):
+        if (output / name).exists():
+            shutil.copy2(output / name, archive / name)
+    for name in ("scores", "metrics.json", "report.html", "plots", "tables"):
+        if (output / name).exists():
+            (output / name).rename(archive / name)
+    print(f"Previous/partial evaluation preserved: {archive}", flush=True)
+
+
+def run_classification(config: dict[str, Any], *, inspect_only: bool = False, resume=None) -> dict[str, Any]:
+    """Train or resume at an epoch boundary; select exclusively on validation."""
+    output = Path(config["output_dir"]).expanduser()
+    if resume and inspect_only:
+        raise ValueError("Resume is supported only for training, not inspection.")
+    saved, resume_source = _read_resume(resume, output, config) if resume else (None, None)
+    if not resume and any((output / name).exists() for name in (
+            "checkpoint.pt", "last_checkpoint.pt", "history.json", "metrics.json", "scores")):
+        raise FileExistsError(f"Refusing to overwrite an existing run: {output}. Use --resume or a new --output-dir.")
     device = resolve_device(config["training"]["device"]) if not inspect_only else torch.device("cpu")
-    output.mkdir(parents=True, exist_ok=True)
-    (output / "resolved_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    runtime = _runtime(device)
+    if saved and saved["runtime"] != runtime:
+        raise ValueError("Resume runtime differs (device/software/platform); use the original environment.")
     print("Building dataset manifest and checking Parquet schemas...", flush=True)
     reader = {key: value for key, value in _reader_settings(config).items() if key != "read_batch_size"}
+    partitions = None
     if config.get("partition_manifest"):
         partitions = load_partition_manifest(config["partition_manifest"])
         for key in ("validation_fraction", "test_fraction"):
             if config["data"][key] != partitions[key]:
                 raise ValueError(f"{key} differs from the saved partition manifest.")
         manifest = bind_partition_manifest(partitions, config["source"], **reader)
-        _write_json(output / "partitions.json", partitions)
     else:
         manifest = build_manifest(config["source"], seed=config["seed"],
                                   validation_fraction=config["data"]["validation_fraction"],
                                   test_fraction=config["data"]["test_fraction"], **reader)
     _binary_settings(config, manifest)
-    if inspect_only and config.get("downstream"):
-        # Also fail inspect for incompatible encoder weights/contracts/provenance.
-        _downstream_metadata(_make_model(config, manifest["label_map"]), config, manifest)
-    preflight = inspect_dataset(manifest, audit_events_per_class=config["data"]["audit_events_per_class"],
-                                **_reader_settings(config))
-    _write_json(output / "dataset_manifest.json", manifest)
-    _write_json(output / "preflight.json", preflight)
+    source_hashes = {f["path"]: f.get("sha256") or sha256_file(f["path"])
+                     for process in manifest["processes"] for f in process["files"]}
+    if saved:
+        _validate_resume_binding(saved, manifest, source_hashes, output)
+        preflight = json.loads((output / "preflight.json").read_text())
+    else:
+        if inspect_only and config.get("downstream"):
+            _downstream_metadata(_make_model(config, manifest["label_map"]), config, manifest)
+        preflight = inspect_dataset(manifest, audit_events_per_class=config["data"]["audit_events_per_class"],
+                                    **_reader_settings(config))
     print(f"Classes: {manifest['label_map']}; device: {device}", flush=True)
     for warning in preflight.get("warnings", []):
         print(f"Preflight: {warning}", flush=True)
+
+    seed, settings = config["seed"], config["training"]
+    model = optimizer = None
+    if not inspect_only:
+        random.seed(seed)
+        np.random.seed(seed % 2**32)
+        torch.manual_seed(seed)
+        torch.set_num_threads(settings["cpu_threads"])
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
+        # Resume loads the downstream state, never reimports the original pretrained weights.
+        model = _make_model(config, manifest["label_map"], initialize_encoder=saved is None).to(device)
+        optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
+                                      lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
+        loaders = {name: _loader(manifest, config, name) for name in ("train", "validation")}
+        if saved:
+            _validate_restored_training(model, optimizer, saved, config, manifest, device, loaders)
+            _archive_run(output)
+            print(f"Resuming after completed epoch {saved['epoch']}; total requested epochs: {settings['epochs']}.", flush=True)
+
+    # All resume checks succeeded before any existing artifacts are replaced.
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "resolved_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    if partitions is not None:
+        _write_json(output / "partitions.json", partitions)
+    _write_json(output / "dataset_manifest.json", manifest)
+    _write_json(output / "preflight.json", preflight)
     if inspect_only:
         return preflight
 
-    seed, settings = config["seed"], config["training"]
-    random.seed(seed)
-    np.random.seed(seed % 2**32)
-    torch.manual_seed(seed)
-    torch.set_num_threads(settings["cpu_threads"])
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(seed)
-    model = _make_model(config, manifest["label_map"]).to(device)
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
-                                  lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
-    loaders = {name: _loader(manifest, config, name) for name in ("train", "validation", "test")}
-    history, best_loss, best_epoch = [], math.inf, 0
-    diagnostics: dict[str, Any] = {"scope": "all selected rows once: first train epoch, final validation and test"}
-    first_train = None
+    start = saved["epoch"] if saved else 0
+    history = copy.deepcopy(saved["history"]) if saved else []
+    best_loss, best_epoch = (saved["best_loss"], saved["best_epoch"]) if saved else (math.inf, 0)
+    best_payload = copy.deepcopy(saved["best_checkpoint"]) if saved else None
+    diagnostics = copy.deepcopy(saved["diagnostics"]) if saved else {
+        "scope": "all selected rows once: first train epoch, final validation and test"}
+    first_train = copy.deepcopy(saved["first_train"]) if saved else None
     metrics = _base_metrics(config, manifest, preflight, device)
-    metrics.update(initialization="random_from_scratch", initial_state_sha256=_initial_state_digest(model),
-                   training_protocol=_training_protocol(config))
-    if config.get("downstream"):
-        metrics["downstream"] = _downstream_metadata(model, config, manifest)
-        metrics["input_contract"] = encoder_contract(config["model"], config["data"])
-        if config["downstream"]["mode"] != "scratch":
-            metrics["initialization"] = "pretrained_encoder_new_head"
-    for epoch in range(1, settings["epochs"] + 1):
+    if saved:
+        metrics.update(copy.deepcopy(saved["initial_metadata"]))
+    else:
+        metrics.update(initialization="random_from_scratch", initial_state_sha256=_initial_state_digest(model))
+        if config.get("downstream"):
+            metrics["downstream"] = _downstream_metadata(model, config, manifest)
+            metrics["input_contract"] = encoder_contract(config["model"], config["data"])
+            if config["downstream"]["mode"] != "scratch":
+                metrics["initialization"] = "pretrained_encoder_new_head"
+    metrics["training_protocol"] = _training_protocol(config)
+
+    def commit_epoch(epoch):
+        # last_checkpoint is the authoritative atomic commit. It contains a recoverable
+        # best snapshot if interrupted before checkpoint.pt/history.json are published.
+        metrics["training_run"] = _training_run(saved, resume_source, start, epoch, config, runtime)
+        best_payload.update(config=copy.deepcopy(config), training_protocol=_training_protocol(config),
+                            training_run=metrics["training_run"])
+        last = {"kind": "flowyforge.classification_resume", "version": 1, "epoch": epoch,
+                "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(),
+                "optimizer_parameters": [n for n, p in model.named_parameters() if p.requires_grad],
+                "best_checkpoint": best_payload, "best_epoch": best_epoch, "best_loss": best_loss,
+                "history": history, "first_train": first_train, "diagnostics": diagnostics,
+                "initial_metadata": {k: metrics[k] for k in ("initialization", "initial_state_sha256", "downstream", "input_contract") if k in metrics},
+                "config": config, "protocol": _resume_protocol(config), "input_contract": _classification_contract(config),
+                "dataset_manifest_sha256": _manifest_digest(manifest), "partition_sha256": manifest.get("partition_sha256"),
+                "source_sha256": source_hashes, "rng": _rng_state(device, loaders),
+                "runtime": runtime, "training_run": metrics["training_run"]}
+        last["state_sha256"] = state_digest(last)
+        _save_checkpoint(output / "last_checkpoint.pt", last)
+        _save_checkpoint(output / "checkpoint.pt", best_payload)
+        _write_json(output / "history.json", history)
+
+    for epoch in range(start + 1, settings["epochs"] + 1):
         started = time.monotonic()
         loaders["train"].dataset.set_epoch(epoch)
         train = _run_epoch(model, loaders["train"], device, manifest["label_map"], optimizer=optimizer,
@@ -551,11 +816,12 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
             first_train = train
         validation = _run_epoch(model, loaders["validation"], device, manifest["label_map"],
                                 log_every_batches=settings["log_every_batches"], description=f"epoch {epoch} validation")
+        if model.freeze_encoder and _initial_state_digest(model.encoder) != metrics["downstream"]["initial_encoder_sha256"]:
+            raise ValueError("Linear probe changed its frozen encoder during training.")
         history.append({"epoch": epoch, "train_loss": train["loss"], "train_accuracy": train["accuracy"],
                         "train_num_events": train["num_events"], "train_duration_seconds": train["duration_seconds"],
                         "train_events_per_second": train["events_per_second"], "validation": validation,
                         "duration_seconds": time.monotonic() - started})
-        _write_json(output / "history.json", history)
         print(f"Epoch {epoch}/{settings['epochs']}: train loss={train['loss']:.5f}, "
               f"validation loss={validation['loss']:.5f}, accuracy={validation['accuracy']:.4f}, "
               f"macro F1={validation['macro_f1']:.4f}", flush=True)
@@ -564,22 +830,24 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False) ->
             if config.get("downstream"):
                 metrics["downstream"]["selected_encoder_sha256"] = _initial_state_digest(model.encoder)
                 metrics["downstream"]["selected_head_sha256"] = _initial_state_digest(model.head)
-            temporary = output / "checkpoint.pt.tmp"
-            torch.save({"format_version": 2 if config.get("downstream") else 1,
-                        **{key: metrics[key] for key in ("downstream", "input_contract") if key in metrics},
+            best_payload = {"format_version": 2 if config.get("downstream") else 1,
+                        **{key: copy.deepcopy(metrics[key]) for key in ("downstream", "input_contract") if key in metrics},
                         "best_validation_loss": best_loss,
-                        "model_state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
-                        "config": config, "label_map": manifest["label_map"], "best_epoch": best_epoch,
+                        "model_state_dict": {key: value.detach().cpu().clone() for key, value in model.state_dict().items()},
+                        "config": copy.deepcopy(config), "label_map": manifest["label_map"], "best_epoch": best_epoch,
                         **{key: metrics[key] for key in ("initialization", "initial_state_sha256", "training_protocol")},
                         "dataset_manifest_sha256": metrics["dataset_manifest_sha256"],
-                        "collection_feature_dims": collection_feature_dims(default_collection_specs(config["data"]["collection_limits"]))}, temporary)
-            temporary.replace(output / "checkpoint.pt")
+                        "collection_feature_dims": collection_feature_dims(default_collection_specs(config["data"]["collection_limits"]))}
+        commit_epoch(epoch)
 
-    checkpoint = torch.load(output / "checkpoint.pt", map_location="cpu", weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    if start == settings["epochs"]:
+        commit_epoch(start)  # Retry interrupted final evaluation with no optimizer updates.
+    model.load_state_dict(best_payload["model_state_dict"], strict=True)
     metrics.update(history=history, best_epoch=best_epoch, best_validation_loss=best_loss,
                    performance=_performance(history), diagnostics=diagnostics)
     metrics["checkpoint_sha256"] = sha256_file(output / "checkpoint.pt")
+    # Test is constructed and iterated only after all optimization/selection is complete.
+    loaders["test"] = _loader(manifest, config, "test")
     for split in ("validation", "test"):
         metrics[split] = _evaluate_split(model, loaders[split], device, manifest, config, split, output, metrics)
     _record_split_counts(metrics, first_train)
@@ -595,7 +863,7 @@ def evaluate_run(checkpoint_path: str | Path, *, output_dir: str | Path,
     """Evaluate the checkpoint on its frozen validation/test rows, never resplit."""
     checkpoint_path = Path(checkpoint_path).expanduser()
     output = Path(output_dir).expanduser()
-    if any((output / name).exists() for name in ("checkpoint.pt", "history.json", "scores")):
+    if any((output / name).exists() for name in ("checkpoint.pt", "last_checkpoint.pt", "history.json", "scores")):
         raise FileExistsError(f"Evaluation output contains an existing training run: {output}. Choose a separate directory.")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     if checkpoint.get("format_version") not in {1, 2}:
@@ -632,7 +900,7 @@ def evaluate_run(checkpoint_path: str | Path, *, output_dir: str | Path,
     preflight = json.loads((checkpoint_path.parent / "preflight.json").read_text(encoding="utf-8"))
     metrics = _base_metrics(config, manifest, preflight, resolved_device)
     metrics.update({key: checkpoint.get(key) for key in ("initialization", "initial_state_sha256", "training_protocol")})
-    metrics.update({key: checkpoint[key] for key in ("downstream", "input_contract", "best_validation_loss") if key in checkpoint})
+    metrics.update({key: checkpoint[key] for key in ("downstream", "input_contract", "best_validation_loss", "training_run") if key in checkpoint})
     metrics["checkpoint_sha256"] = sha256_file(checkpoint_path)
     history_path = checkpoint_path.parent / "history.json"
     metrics.update(best_epoch=checkpoint["best_epoch"], history=json.loads(history_path.read_text()) if history_path.exists() else [],

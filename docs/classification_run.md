@@ -83,7 +83,8 @@ python scripts/run_classification.py \
 
 Servono almeno due classi e tre eventi per classe. Si può riutilizzare la directory
 di `inspect`; per ripetere un training usare una directory nuova. La presenza di
-`checkpoint.pt`, `history.json` o `metrics.json` impedisce una sovrascrittura.
+`checkpoint.pt`, `last_checkpoint.pt`, `history.json` o `metrics.json` impedisce
+una sovrascrittura senza `--resume` esplicito.
 Ogni training ricostruisce e verifica il manifest prima di iniziare.
 
 ## 2. EOS: controllare layout e dati senza training
@@ -245,7 +246,7 @@ adatto anche quando il processo principale usa CUDA. Lo shuffle è limitato in
 memoria, non una permutazione globale degli eventi già caricati.
 
 Tutti i parametri di tokenizer, encoder e classificatore vengono addestrati con
-AdamW e gradient clipping. Il checkpoint viene aggiornato quando migliora la loss
+AdamW e gradient clipping. I pesi del best vengono aggiornati quando migliora la loss
 di validazione. Il test viene letto dopo la selezione del modello. I contatori di
 diagnostica finale coprono una volta le righe selezionate: prima epoca di training
 e valutazione finale di validation/test; l'audit campionato rimane separato.
@@ -269,7 +270,8 @@ SHA256 e permette la rilocazione esplicita descritta sopra.
 Senza `--output-dir`, l'output è `CHECKPOINT_DIR/evaluation`. La diagnostica di
 questa fase copre solo validation/test. `--batch-size` e `--num-workers` possono
 essere cambiati senza cambiare la selezione; possono variare l'ordine e piccoli
-arrotondamenti numerici. `--checkpoint` non implementa resume del training.
+arrotondamenti numerici. Per il resume del training usare `--stage train --resume
+RUN_DIR/last_checkpoint.pt`; `--checkpoint` rimane riservato alla valutazione.
 Usare una directory di valutazione separata: gli output di training sono protetti
 anche da sovrascritture tramite questa fase.
 
@@ -292,6 +294,8 @@ Questa fase legge solo `metrics.json`, senza training né lettura dei Parquet.
 | `partitions.json` (opzionale) | Appartenenze stabili condivise; copia del manifest scelto tramite `--partition-manifest` |
 | `preflight.json` | Audit limitato dei valori e riepilogo dei controlli |
 | `checkpoint.pt` | Parametri del modello selezionato, configurazione e digest del manifest |
+| `last_checkpoint.pt` | Ultima epoca completata: pesi, AdamW, RNG/loader, history, best completo e protocollo; resume atomico |
+| `resume_archive/run-*/` | Valutazioni precedenti/parziali e copie degli artefatti conservate prima della ripresa |
 | `history.json` | Training e validazione per epoca, scritto progressivamente |
 | `metrics.json` | Metriche aggregate, per classe e diagnostica |
 | `scores/{validation,test}/` (opzionale) | Score della classe segnale, identità originali, label e split; shard Parquet e manifest con checksum |
@@ -314,7 +318,64 @@ Il manifest legacy salva percorsi assoluti e fingerprint dei file. Per spostare
 i dati usare un run con partizioni condivise e `--data-root` in valutazione.
 La riproducibilità riguarda input/configurazione invariati; non garantisce identità
 bit a bit tra device e versioni PyTorch. Un nuovo cap o inventario produce un nuovo
-manifest. Il runner usa un singolo device, senza DDP né resume.
+manifest. Il runner usa un singolo device, senza DDP; supporta il resume ai confini
+delle epoche con dati/protocollo e ambiente invariati.
+
+## Resume di classificazione
+
+La guida operativa con esempi FullReco/L1T per legacy, scratch, linear probe e
+fine-tuning è nel [README](../README.md#riprendere-il-training-di-classificazione-con---resume).
+`run_classification(config, resume=path)` riusa lo stesso ciclo di training.
+`--epochs` è il numero totale richiesto, mai il numero aggiuntivo; il protocollo
+esclude soltanto l'orizzonte epoche e i percorsi dei file di configurazione/output.
+Tutte le altre impostazioni, incluso il runtime effettivo, devono coincidere.
+I checkpoint inference v1/v2 rimangono leggibili; non contengono lo stato per
+ripartire esattamente e non sono convertiti in checkpoint di resume.
+
+`training/checkpointing.py` contiene il salvataggio atomico e gli snapshot RNG
+già usati dal pretraining, ora condivisi. `last_checkpoint.pt` ha tipo
+`flowyforge.classification_resume`, versione 1, più un checksum strutturale
+dei metadati e dei tensori. Comprende stato Python/NumPy/Torch CPU e, sul device
+usato, CUDA o MPS, generatori train/validation, nomi ordinati dei parametri
+AdamW, momenti, epoca, history, diagnostica della prima epoca, provenienza,
+contratto, hash dei file/manifest e snapshot del best. Anche i manifest legacy
+v1 hanno qui un hash separato di ogni file per il controllo del resume; non
+viene modificato il loro algoritmo di campionamento né il reader.
+
+L'ordine di salvataggio per epoca è `last_checkpoint.pt` atomico, poi
+`checkpoint.pt` atomico e `history.json`. Il primo è lo stato di riferimento:
+un'interruzione fra le scritture lascia un best/history recuperabile dal suo
+snapshot. Uno stato finale completo con valutazione interrotta ammette resume
+allo stesso orizzonte per rigenerare solo gli output finali. Se non esiste una
+prima epoca completata, non è disponibile il resume.
+
+La validazione avviene prima di archiviare/sostituire gli artefatti: contratto,
+dataset/partizioni, checksum, history contigua e selezione minima validation,
+chiavi/forme/pesi finiti, gruppi AdamW e forme dei momenti, RNG, provenienza e
+policy di freezing. Il modello viene costruito con `initialize_encoder=False`
+e riceve strict i pesi downstream, mai l'inizializzazione pretrained. Nel probe
+si verifica l'encoder in eval, senza parametri allenabili e con fingerprint
+immutato; l'optimizer contiene solo la testa. Il pretrained originale può
+essere assente; se presente, deve mantenere l'hash registrato.
+
+Prima di continuare si conservano score/report e copie dei checkpoint/manifest
+in `resume_archive/`. I nuovi score usano il fingerprint del best aggiornato e
+il percorso standard. Il test è letto solo dopo la selezione finale; i risultati
+di un precedente test non vengono letti per adattare il training. Il report
+espone `training_run` con sessioni, epoche eseguite, provenienza del resume e
+limiti di riproducibilità. I comparatori ignorano l'interruzione come differenza
+di inizializzazione, ma continuano a richiedere lo stesso orizzonte totale,
+protocollo, identità, score verificati e checkpoint compatibile.
+
+I loader non usano worker persistenti. L'epoca del dataset viene impostata sul
+numero assoluto della nuova epoca, preservando mixing/shuffle e assegnazione
+dei row group; i generatori ripristinati determinano i seed dei nuovi worker.
+I buffer di prefetch non sono salvati: il resume è esclusivamente ai confini
+delle epoche. L'uguaglianza bit a bit è testata su CPU/worker 0 nello stesso
+ambiente; timing e throughput differiscono, e non si garantisce identità su
+acceleratori, più worker o altro hardware. `tests/test_classification_resume.py`
+include replay continuo vs interrotto, freezing, optimizer, crash a metà epoca
+e fra checkpoint, rigetti prima delle scritture e compatibilità dei confronti.
 
 ## Verifiche software
 

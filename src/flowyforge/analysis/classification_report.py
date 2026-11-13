@@ -736,12 +736,12 @@ def write_classification_report(metrics: dict[str, Any], output_dir: str | Path)
                     ax.set_axisbelow(True)
                     save(fig, "data_diagnostics" if key == "diagnostics" else "preflight_audit", title)
 
-    for key in ("downstream", "performance"):
+    for key in ("downstream", "performance", "training_run"):
         if metrics.get(key):
             table(key, key.title(), _flatten(metrics[key]), ["quantity", "value"])
 
     metadata = [{"quantity": key, "value": metrics[key]} for key in
-                ("view", "device", "seed", "best_epoch", "initialization") if key in metrics]
+                ("view", "device", "seed", "best_epoch", "best_validation_loss", "initialization") if key in metrics]
     content = ["<h1>FlowyForge · Classification</h1>", '<p class="subtitle">Preliminary results · unweighted event classification</p>', _table(metadata, ["quantity", "value"])]
     warnings = metrics.get("warnings") or []
     if isinstance(warnings, str):

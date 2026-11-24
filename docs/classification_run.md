@@ -298,6 +298,7 @@ Questa fase legge solo `metrics.json`, senza training né lettura dei Parquet.
 | `resume_archive/run-*/` | Valutazioni precedenti/parziali e copie degli artefatti conservate prima della ripresa |
 | `history.json` | Training e validazione per epoca, scritto progressivamente |
 | `metrics.json` | Metriche aggregate, per classe e diagnostica |
+| `computation_stats.md` | CLI `train`/`inspect`, anche pretraining: wall-clock, CPU user/system del processo e dei figli terminati, hardware/software; una sezione per invocazione/resume. CUDA: intervallo dello stream, inclusivo delle attese, non tempo GPU attivo. Dettagli e limiti nel README, sezione «Device, output e limiti» |
 | `scores/{validation,test}/` (opzionale) | Score della classe segnale, identità originali, label e split; shard Parquet e manifest con checksum |
 | `tables/binary_*.csv`, `tables/roc_*.csv`, `plots/roc_*.png/.pdf` | Metriche binarie e curve ROC, se `evaluation.signal_process` è configurato |
 | `report.html` | Report autonomo, con immagini incorporate, condivisibile senza server |

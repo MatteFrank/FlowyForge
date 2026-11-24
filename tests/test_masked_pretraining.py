@@ -295,6 +295,14 @@ def test_pretraining_cli_inspect_and_configuration(tmp_path):
     completed = subprocess.run(command, cwd=REPO, capture_output=True, text=True)
     assert completed.returncode == 0, completed.stderr
     assert "test excluded" in completed.stdout
+    output = Path(load_pretraining_config(config_path)["output_dir"])
+    statistics = (output / "computation_stats.md").read_text()
+    assert "| Stage | inspect |" in statistics
+    assert "| Device used | cpu |" in statistics
+    completed = subprocess.run(command[:-1] + ["train"], cwd=REPO, capture_output=True, text=True)
+    assert completed.returncode == 0, completed.stderr
+    assert (output / "computation_stats.md").read_text().startswith(statistics)
+    assert "| Stage | train |" in (output / "computation_stats.md").read_text()
     config = load_pretraining_config(REPO / "configs/runs/collide_pretraining.yaml")
     assert config["pretraining"]["probability"] == .15
     assert "PUPPIMET" not in config["pretraining"]["targets"]

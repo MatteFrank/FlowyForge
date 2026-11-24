@@ -43,8 +43,14 @@ def main():
                 processes[name] = path
             overrides["processes"] = processes
         config = load_pretraining_config(args.config, overrides)
-        result = run_pretraining(config, inspect_only=args.stage == "inspect", resume=args.resume)
         output = Path(config["output_dir"])
+        from flowyforge.training.classification_run import resolve_device
+        from flowyforge.training.run_statistics import computation_statistics
+
+        with computation_statistics(output, stage=args.stage, resume=args.resume,
+                device=resolve_device(config["training"]["device"] if args.stage == "train" else "cpu"),
+                num_workers=config["training"]["num_workers"]):
+            result = run_pretraining(config, inspect_only=args.stage == "inspect", resume=args.resume)
         if args.stage == "inspect":
             print(f"Preflight: {output / 'preflight.json'}; test excluded.")
         else:

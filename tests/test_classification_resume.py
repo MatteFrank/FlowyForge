@@ -134,6 +134,10 @@ def test_resumed_comparators_evaluate_report_and_cli(pilot, resumed_runs, tmp_pa
                "--resume", str(tmp_path / "l1t/checkpoint.pt")]
     done = subprocess.run(command, capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
+    statistics = (tmp_path / "l1t/computation_stats.md").read_text()
+    assert "| Device used | cpu |" in statistics
+    assert "| Resume source |" in statistics and "l1t/checkpoint.pt" in statistics
+    assert "| Real / wall time (s) |" in statistics
     compare_classification_runs([root / "scratch", tmp_path / "l1t"], tmp_path / "views")
     for mode in ("legacy", "finetune"):
         result = runner.evaluate_run(root / mode / "checkpoint.pt", output_dir=tmp_path / f"eval_{mode}", device="cpu")

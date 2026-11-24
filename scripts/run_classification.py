@@ -113,8 +113,14 @@ def main() -> int:
                 save_partition_manifest(partitions, target)
                 print(f"Partitions: {target}; counts: {partitions['split_counts']}; SHA256: {partitions['sha256']}")
                 return 0
-            metrics = run_classification(config, inspect_only=args.stage == "inspect", resume=args.resume)
             output = Path(config["output_dir"])
+            from flowyforge.training.classification_run import resolve_device
+            from flowyforge.training.run_statistics import computation_statistics
+
+            with computation_statistics(output, stage=args.stage, resume=args.resume,
+                    device=resolve_device(config["training"]["device"] if args.stage == "train" else "cpu"),
+                    num_workers=config["training"]["num_workers"]):
+                metrics = run_classification(config, inspect_only=args.stage == "inspect", resume=args.resume)
         if args.stage == "inspect":
             print(f"Preflight complete: {output / 'preflight.json'}")
         else:

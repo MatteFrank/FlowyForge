@@ -1547,6 +1547,26 @@ La scansione iniziale dei footer interessa comunque tutti i file selezionati.
 
 ## Device, output e limiti
 
+`scripts/run_classification.py` e `scripts/run_pretraining.py` scrivono automaticamente
+`<output-dir>/computation_stats.md` dopo ogni `--stage train` o `--stage inspect`
+completato, senza flag aggiuntivi. I comandi documentati sopra restano invariati.
+Il file riporta tempo reale (wall-clock), tempo CPU del processo principale
+(totale, user e system), CPU dei subprocessi terminati/attesi (inclusi i worker
+DataLoader), device usato, modello CPU/GPU, memoria GPU, thread, worker e versioni
+software. La misura comprende la chiamata al runner, inclusi I/O, preflight,
+valutazioni e report automatici; esclude import/configurazione iniziale e scrittura
+delle statistiche. CPU parallele possono accumulare più secondi del wall-clock.
+
+Su CUDA è riportato anche l'intervallo fra due eventi dello stream del device:
+**include le attese CPU/I/O, non è tempo GPU attivo né utilizzo GPU**. Il tempo
+dei kernel non viene profilato, per evitare il costo di un profiler sempre attivo.
+Su CPU/MPS la relativa misura è `N/A`; su Windows la CPU dei subprocessi è `N/A`.
+Un resume aggiunge una sezione per la sola nuova invocazione, conservando quelle
+precedenti. Run falliti/interrotti non aggiungono una sezione. Il file è separato
+da metriche, history e checkpoint e non cambia selezione o riproducibilità del
+training. Gli altri stadi della CLI e le chiamate dirette alle API Python non
+attivano questa misura.
+
 `--device auto` sceglie CUDA, poi MPS, poi CPU. `--device cpu` è il riferimento
 portabile; `--device cuda:0` e `--device mps` richiedono un backend disponibile.
 Il supporto nel codice non equivale a una verifica su ogni hardware/cluster.

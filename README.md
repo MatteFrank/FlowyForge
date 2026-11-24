@@ -1545,6 +1545,246 @@ python scripts/run_classification.py --stage evaluate --checkpoint outputs/perce
 Il reader costruisce batch progressivamente; non carica tutti gli eventi in RAM.
 La scansione iniziale dei footer interessa comunque tutti i file selezionati.
 
+## TERABIT / HPC Bubble: job Slurm CPU e GPU
+
+Due script Bash commentati riusano i runner esistenti:
+
+- [`scripts/slurm/run.sbatch`](scripts/slurm/run.sbatch): training/ispezione,
+  singola vista o array FullReco/L1T, su CPU o una GPU CUDA per job.
+- [`scripts/slurm/status.sh`](scripts/slurm/status.sh): stato, accounting e
+  snapshot testuale dei controlli, anche dopo la fine del job.
+
+Configurazione **INFN-CNAF TERABIT/Bubble**, con parametri forniti dall'utente:
+
+| Impostazione | Valore |
+| --- | --- |
+| Login node | `ui-terabit.cr.cnaf.infn.it` |
+| Partizione CPU | `bare-metal-nodes` |
+| Partizione GPU, preferita per training ML | `bare-metal-GPU` |
+| Partizione generale di default del sito | `all-nodes` |
+| Account Slurm | `kamiknows` |
+| QoS | `kamiknows` |
+
+`run.sbatch` imposta account e QoS `kamiknows`. Il default dello script resta CPU
+su `bare-metal-nodes`; gli esempi di training GPU selezionano esplicitamente
+`bare-metal-GPU` e una GPU. Il default del sito `all-nodes` non viene usato
+implicitamente. Tutte queste direttive sono sovrascrivibili tramite `sbatch`.
+Account/QoS non identificano necessariamente lo username SSH.
+
+La [documentazione INFN-CNAF](https://confluence.infn.it/spaces/TD/pages/40665319/7%2B-%2BThe%2BHPC%2Bcluster)
+conferma l'accesso tramite Slurm e account HPC dedicato. I nomi nella tabella
+provengono dall'utente, non da una verifica remota dell'account. Esempi e sintassi
+sono stati verificati sulla documentazione ufficiale
+[sbatch](https://slurm.schedmd.com/sbatch.html),
+[job array](https://slurm.schedmd.com/job_array.html),
+[sacct](https://slurm.schedmd.com/sacct.html) e
+[sstat](https://slurm.schedmd.com/sstat.html). Non sono stati inviati job reali
+a TERABIT durante lo sviluppo: i test locali simulano Slurm ed eseguono piccoli
+runner CPU. Disponibilità delle risorse e limiti correnti vanno controllati sul login node.
+
+### Preparazione sul cluster
+
+Accedere con `ssh TUO_USERNAME@ui-terabit.cr.cnaf.infn.it` tramite il percorso
+di rete/accesso già previsto dal sito. Usare Bash sul login node e posizionarsi nella root della repository su un
+filesystem accessibile anche ai compute node. Preparare lì una venv e installare
+FlowyForge come nella sezione installazione; non copiare la venv dal Mac. Per GPU
+serve una build PyTorch CUDA compatibile con il sito. Dati, partizioni, encoder,
+configurazioni e output devono essere raggiungibili dai nodi: un path EOS valido
+al CERN non è automaticamente montato su TERABIT. Configurare i YAML `sources`
+oppure i relativi override del reader e verificare la rilocazione dei manifest.
+
+```bash
+# Individua code, limiti e tipi di GPU realmente esposti dal tuo sito.
+sinfo -o '%P %a %l %D %G'
+scontrol show partition
+# Se consentito, mostra associazioni account/partition/QOS del proprio utente.
+sacctmgr show associations where user="$USER" format=Cluster,Account,Partition,QOS
+
+# Partizioni CNAF indicate dall'utente; account/QoS sono già nel batch script.
+export FF_CPU_PARTITION="bare-metal-nodes"
+export FF_GPU_PARTITION="bare-metal-GPU"
+export FLOWYFORGE_PYTHON="$PWD/.venv/bin/python"
+# Creare PRIMA di sbatch: Slurm apre stdout/stderr prima di eseguire lo script.
+mkdir -p outputs/slurm_logs
+```
+
+Per CNAF non occorre ripetere `--account=kamiknows --qos=kamiknows`: sono già
+direttive dello script. Per un altro progetto/sito, sovrascriverle con
+`--account=NOME_ACCOUNT --qos=NOME_QOS` e scegliere la relativa partizione.
+Se sono richiesti moduli nel batch,
+esportare `FLOWYFORGE_SETUP=/percorso/assoluto/setup-site.sh`: lo script esegue
+`source` su quel file, che deve contenere i comandi `module load` verificati sul
+sito. Nessuna installazione o download viene eseguita automaticamente dal job.
+`FLOWYFORGE_REPO` può indicare una checkout assoluta alternativa; normalmente
+basta sottomettere dalla root. Evitare di cambiare codice/config/dati mentre
+un array è in coda o in esecuzione: il batch riusa i file del filesystem condiviso.
+
+### Interfaccia e risorse
+
+```text
+sbatch [opzioni Slurm] scripts/slurm/run.sbatch classification|pretraining CONFIG OUTPUT_ROOT cpu|cuda [opzioni runner]
+```
+
+Le opzioni Slurm precedono il file `.sbatch`; quelle del runner lo seguono.
+I default nello script sono **1 nodo, 1 task, 6 CPU, 16 GiB RAM, 1 ora**, una
+sola vista FullReco e nessuna GPU. Sono valori iniziali modificabili tramite
+`sbatch`, non una stima validata del pilot. RAM (`--mem`) e memoria GPU sono
+risorse diverse. `cuda` richiede anche `--gres=gpu:1`; se il sito impone un tipo,
+usare `--gres=gpu:TIPO:1` con il nome restituito da `sinfo`.
+
+| Controllo | Significato |
+| --- | --- |
+| `--array=0%1` | Solo FullReco (default) |
+| `--array=1%1` | Solo L1T |
+| `--array=0-1%2` | Due training indipendenti, al massimo due contemporanei |
+| `--array=0-1%1` | Le due viste in sequenza, con un solo job attivo |
+| `--cpus-per-task=N` | CPU assegnate a ciascun elemento; deve coprire almeno `training.cpu_threads + num_workers` |
+| `training.cpu_threads` nel YAML | Thread Torch effettivi; aumentare solo `OMP_NUM_THREADS` non sostituisce questo valore |
+| `--num-workers N` dopo gli argomenti dello script | Worker del DataLoader, non processi di training distribuito |
+| `--time=HH:MM:SS`, `--mem=32G` | Limite wall-clock e RAM per singolo job |
+| `--dependency=afterok:JOBID` | Attende il completamento positivo del job/array precedente |
+| `FLOWYFORGE_RESUME=1` | Ripresa esplicita dal checkpoint nella stessa directory della vista |
+
+Ogni elemento esegue **un solo trainer su un solo device** tramite `srun`.
+Il parallelismo implementato è fra esperimenti/vista e nella lettura dei batch;
+non esiste DDP o distribuzione di un unico modello fra GPU/nodi. Non dividere i
+processi fisici o ricreare gli split per ogni job: riusare gli stessi Parquet e
+manifest. L'array mantiene invariati eventi e protocollo del YAML e cambia vista
+e directory (`OUTPUT_ROOT/fullreco`, `OUTPUT_ROOT/l1t`). Per ulteriori esperimenti,
+seed o modalità usare altre sottomissioni e **OUTPUT_ROOT distinti**. Gli indici
+di array diversi da 0/1 vengono rifiutati.
+
+Opzioni del runner inoltrate: `--epochs`, `--batch-size`, `--num-workers`,
+`--seed`, `--partition-manifest`, `--data-root`, `--mode`, `--model-config`,
+`--process` ripetibile, `--process-name` ripetibile, `--max-events-per-class`,
+`--downstream-mode`, `--encoder-checkpoint`, `--stage train|inspect`.
+Usare due token (`--epochs 3`, non `--epochs=3`). Le opzioni specifiche di
+classificazione restano disponibili solo per quel runner. `--view`, `--device`,
+`--output-dir`, `--config` e `--resume` sono gestiti dallo script. Le altre fasi
+(`evaluate`, `report`, `compare`, `compare-transfer`, `partitions`) restano nei
+runner ordinari documentati sopra. Creare le partizioni una volta prima dell'array.
+
+### Esempi CPU, GPU e dipendenze
+
+I comandi seguenti presuppongono campione pilot e partizioni già preparati.
+Il default di training resta quello nel YAML (3 epoche nei config pilot).
+
+Avvio diretto CNAF consigliato per il pretraining ML, dopo la preparazione della
+venv e dei dati: entrambe le viste in parallelo, ciascuna con una GPU e output
+separati. Account e QoS sono scritti anche nel comando per renderlo esplicito:
+
+```bash
+mkdir -p outputs/slurm_logs
+export FLOWYFORGE_PYTHON="$PWD/.venv/bin/python"
+sbatch --account=kamiknows --qos=kamiknows --partition=bare-metal-GPU --gres=gpu:1 --array=0-1%2 --job-name=ff-pretrain --time=04:00:00 --mem=32G scripts/slurm/run.sbatch pretraining configs/runs/collide_pretraining.yaml outputs/terabit/pretraining cuda
+```
+
+Questo è un'alternativa al comando `pre_id=$(sbatch ...)` seguente: non eseguirli
+entrambi sulla stessa root di output. Per classificazione supervisionata usare
+`classification configs/runs/collide_supervised.yaml outputs/terabit/reference_gpu cuda`
+come argomenti dello stesso script.
+
+```bash
+# Controllo Slurm delle risorse senza sottomettere/eseguire il training.
+# Non controlla dati, import Python o correttezza scientifica del run.
+sbatch --test-only --partition="$FF_CPU_PARTITION" scripts/slurm/run.sbatch classification configs/runs/collide_supervised.yaml outputs/terabit/reference_cpu cpu
+
+# Preflight di entrambe le viste su CPU: nessun training, un job alla volta.
+sbatch --partition="$FF_CPU_PARTITION" --array=0-1%1 scripts/slurm/run.sbatch classification configs/runs/collide_supervised.yaml outputs/terabit/inspect cpu --stage inspect
+
+# Riferimento supervisionato su CPU: due viste in parallelo, output distinti.
+sbatch --partition="$FF_CPU_PARTITION" --job-name=ff-reference --array=0-1%2 scripts/slurm/run.sbatch classification configs/runs/collide_supervised.yaml outputs/terabit/reference_cpu cpu --num-workers 2
+
+# Pretraining: un GPU job per vista, massimo due GPU job contemporanei.
+# --parsable restituisce JOBID oppure JOBID;CLUSTER; conservare l'ID numerico.
+pre_id=$(sbatch --parsable --partition="$FF_GPU_PARTITION" --gres=gpu:1 --job-name=ff-pretrain --array=0-1%2 --time=04:00:00 --mem=32G scripts/slurm/run.sbatch pretraining configs/runs/collide_pretraining.yaml outputs/terabit/pretraining cuda)
+pre_id=${pre_id%%;*}
+echo "Pretraining array: $pre_id"
+
+# Due linear probe dopo che ENTRAMBI i pretraining sono terminati con successo.
+# Il segnaposto letterale {view} diventa fullreco/l1t, senza shell eval.
+sbatch --partition="$FF_GPU_PARTITION" --gres=gpu:1 --array=0-1%2 --job-name=ff-probe --dependency="afterok:$pre_id" scripts/slurm/run.sbatch classification configs/runs/collide_downstream.yaml outputs/terabit/linear_probe cuda --downstream-mode linear_probe --encoder-checkpoint 'outputs/terabit/pretraining/{view}/encoder.pt'
+
+# Fine-tuning indipendente, con lo stesso encoder per vista e gli stessi split.
+sbatch --partition="$FF_GPU_PARTITION" --gres=gpu:1 --array=0-1%2 --job-name=ff-finetune --dependency="afterok:$pre_id" scripts/slurm/run.sbatch classification configs/runs/collide_downstream.yaml outputs/terabit/finetune cuda --downstream-mode finetune --encoder-checkpoint 'outputs/terabit/pretraining/{view}/encoder.pt'
+
+# Scratch non richiede un encoder e può essere eseguito indipendentemente.
+sbatch --partition="$FF_GPU_PARTITION" --gres=gpu:1 --array=0-1%2 --job-name=ff-scratch scripts/slurm/run.sbatch classification configs/runs/collide_downstream.yaml outputs/terabit/scratch cuda --downstream-mode scratch
+```
+
+Un array ha risorse omogenee. Per assegnare una vista a CPU e l'altra a GPU,
+sottomettere separatamente `--array=0%1 ... cpu` e `--array=1%1 ... cuda`, con
+le rispettive partizioni; il confronto scientifico dovrà dichiarare i device.
+Il limite `%2` vale per ciascun array: tre array concorrenti possono usare sei
+GPU. Ridurre la concorrenza se storage condiviso, quota o lettura sono il limite.
+
+### Log, errori e verifica dell'esito
+
+| Output | Contenuto |
+| --- | --- |
+| `outputs/slurm_logs/NOME-JOBID_INDICE.out` | Stdout del batch e del runner, senza buffering Python |
+| `outputs/slurm_logs/NOME-JOBID_INDICE.err` | Stderr, traceback, errori di `srun`/ambiente; può contenere warning anche nei run riusciti |
+| `OUTPUT_ROOT/{fullreco,l1t}/slurm/JOBID_INDICE/run.txt` | Comando quotato, vista/device, nodo, commit Git, thread/worker, orari, durata wrapper, exit code |
+| `OUTPUT_ROOT/{fullreco,l1t}/computation_stats.md` | Statistiche del runner dopo il completamento positivo, descritte nella sezione seguente |
+| `outputs/slurm_logs/status-JOBID-*.txt` | Snapshot di coda, accounting, risorse e dettagli prodotto da `status.sh` |
+
+Checkpoint, metriche, history, score e report scientifici rimangono nelle normali
+directory del runner. I log Slurm sono creati quando il job parte; un job pending
+può non avere ancora file. `--output`/`--error` di sbatch possono cambiare i path,
+ma la directory destinazione deve esistere prima della sottomissione.
+
+```bash
+# Sostituire 12345 con l'ID ricevuto da sbatch.
+bash scripts/slurm/status.sh 12345
+bash scripts/slurm/status.sh 12345_1
+tail -f outputs/slurm_logs/ff-pretrain-12345_0.out
+tail -n 100 outputs/slurm_logs/ff-pretrain-12345_0.err
+# Cancellare solo se desiderato: il primo comando cancella l'intero array.
+scancel 12345
+scancel 12345_1
+```
+
+`status.sh` salva le risposte di `squeue`, `sacct`, `sstat`, `scontrol`; non modifica
+job e non trasforma l'exit code del comando di monitoraggio nell'esito del training.
+Verificare `COMPLETED` e `ExitCode=0:0` anche sullo step `srun`, quindi controllare
+metriche/report. `PENDING` richiede di leggere la ragione; `OUT_OF_MEMORY` riguarda
+la RAM del job, mentre un errore CUDA OOM appare normalmente nel traceback.
+`TIMEOUT`, `FAILED`, `CANCELLED`, `NODE_FAIL`, `PREEMPTED` richiedono ispezione.
+Una coda vuota non implica successo. Accounting/live metrics possono essere
+ritardati o non disponibili secondo i plugin del sito; `MaxRSS` va letto sulle
+righe degli step. `TotalCPU` è CPU contabilizzata; `CPUTime` sarebbe CPU assegnate
+per wall-clock, non tempo di calcolo realmente consumato. Non si deduce utilizzo
+GPU dai contatori CPU. Dopo SIGKILL o guasto del nodo `run.txt` può non avere la
+riga finale: consultare `sacct`.
+
+### Interruzioni ed epoche suddivise fra job
+
+Non è attivato il requeue automatico. Per riprendere una vista fallita usare il
+suo indice e la stessa root/configurazione; la classificazione usa
+`last_checkpoint.pt`, il pretraining `checkpoint.pt`. L'ultima epoca incompleta
+viene rieseguita; senza un checkpoint completo lo script rifiuta il resume.
+`--epochs` resta il totale desiderato, non le epoche aggiuntive.
+
+```bash
+# Esempio: L1T linear probe interrotto; riprende fino all'epoca totale 20.
+FLOWYFORGE_RESUME=1 sbatch --partition="$FF_GPU_PARTITION" --gres=gpu:1 --array=1%1 --job-name=ff-probe-resume scripts/slurm/run.sbatch classification configs/runs/collide_downstream.yaml outputs/terabit/linear_probe cuda --downstream-mode linear_probe --encoder-checkpoint 'outputs/terabit/pretraining/{view}/encoder.pt' --epochs 20
+
+# Suddivisione PIANIFICATA: pretraining FullReco, epoche 1–3 e poi 4–6.
+# La seconda parte può partire soltanto dopo il successo della prima.
+chunk_id=$(sbatch --parsable --partition="$FF_CPU_PARTITION" --array=0%1 scripts/slurm/run.sbatch pretraining configs/runs/collide_pretraining.yaml outputs/terabit/pretraining_chunks cpu --epochs 3)
+chunk_id=${chunk_id%%;*}
+FLOWYFORGE_RESUME=1 sbatch --partition="$FF_CPU_PARTITION" --array=0%1 --dependency="afterok:$chunk_id" scripts/slurm/run.sbatch pretraining configs/runs/collide_pretraining.yaml outputs/terabit/pretraining_chunks cpu --epochs 6
+```
+
+I segmenti dello stesso modello sono **sequenziali**; eseguirli simultaneamente
+nella stessa directory corromperebbe l'esperimento. Se il predecessore fallisce,
+`afterok` non avvia il successore: controllare/cancellare il job dipendente e
+risottomettere esplicitamente. Conservare impostazioni e ambiente richiesti dal
+contratto resume; non cambiare device o worker per aggirare un errore. L'identità
+numerica fra job su GPU/nodi diversi non è garantita. La classificazione valuta
+il test al termine di ogni invocazione: fissare l'orizzonte in anticipo e non
+usare quei risultati per decidere se estendere il training.
+
 ## Device, output e limiti
 
 `scripts/run_classification.py` e `scripts/run_pretraining.py` scrivono automaticamente

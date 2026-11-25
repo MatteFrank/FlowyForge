@@ -723,8 +723,12 @@ def run_classification(config: dict[str, Any], *, inspect_only: bool = False, re
                                   validation_fraction=config["data"]["validation_fraction"],
                                   test_fraction=config["data"]["test_fraction"], **reader)
     _binary_settings(config, manifest)
-    source_hashes = {f["path"]: f.get("sha256") or sha256_file(f["path"])
-                     for process in manifest["processes"] for f in process["files"]}
+    # Fast input metadata is already bound and checked; do not rehash all payloads
+    # here or claim dummy content hashes. The exact partition/binding digests
+    # still protect resume, and cross-policy checkpoint reuse remains forbidden.
+    source_hashes = ({} if manifest.get("check_integrity_SHA256") == "fast" else
+                     {f["path"]: f.get("sha256") or sha256_file(f["path"])
+                      for process in manifest["processes"] for f in process["files"]})
     if saved:
         _validate_resume_binding(saved, manifest, source_hashes, output)
         preflight = json.loads((output / "preflight.json").read_text())

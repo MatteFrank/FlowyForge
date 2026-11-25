@@ -16,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--downstream-mode", choices=("scratch", "linear_probe", "finetune"),
                         help="Explicit benchmark with a common linear head; omitted preserves the legacy classifier.")
     parser.add_argument("--encoder-checkpoint", help="Exported encoder.pt, required by linear_probe/finetune.")
-    parser.add_argument("--partition-manifest", help="Create at --stage partitions; reuse for inspect/train. Path relative to cwd.")
+    parser.add_argument("--partition-manifest", help="Create strict v1 at --stage partitions; reuse strict v1 / fast v2 for inspect/train. Path relative to cwd.")
     parser.add_argument("--mode", choices=("small", "eos"))
     parser.add_argument("--process", action="append", metavar="NAME=PATH_OR_GLOB",
                         help="Repeat for each class. Overrides the selected YAML process map; quote globs.")

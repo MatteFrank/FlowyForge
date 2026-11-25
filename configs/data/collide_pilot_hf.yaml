@@ -19,3 +19,11 @@ model_config: ../models/foundation_tiny.yaml
 reader:
   # Assumptions when input metadata does not declare units; inspect raw ranges.
   units: {momentum: GeV, angle: rad}
+# Memberships are collected during export; one process per independent file.
+partitions:
+  enabled: true
+  check_integrity_SHA256: fast  # strict preserves full file/event verification (v1).
+  validation_fraction: 0.2
+  test_fraction: 0.2
+  read_batch_size: 2048  # Provenance batches for --stage partitions on existing exports.
+  num_workers: 4  # 1, 2, 4 or 8; allocate CPUs and memory for these processes.

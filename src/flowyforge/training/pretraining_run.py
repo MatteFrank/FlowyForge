@@ -38,7 +38,7 @@ def load_pretraining_config(path, overrides=None):
     _positive_integer(masking["decoder_hidden_dim"], "decoder_hidden_dim")
     config = _resolve_run_config(raw, path, overrides)
     if not config["partition_manifest"]:
-        raise ValueError("Pretraining requires the shared partition_manifest; create it with run_classification.py --stage partitions.")
+        raise ValueError("Pretraining requires the shared partition_manifest; create it during prepare_collide_source.py --stage prepare/partitions or run_classification.py --stage partitions (strict).")
     config.pop("evaluation")  # Supervised evaluation settings have no role in masking.
     config["pretraining"] = masking
     config["reporting"] = reporting

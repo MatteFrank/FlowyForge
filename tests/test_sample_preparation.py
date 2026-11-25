@@ -58,6 +58,7 @@ def fixture_config(tmp_path, *, rows=15, selected=9):
         "MuonTight": 0, "PhotonTight": 0, "PUPPIMET": 1}}}), encoding="utf-8")
     config = {"source": {"kind": "local", "processes": processes},
               "model_config": "model.yaml", "output_dir": str(tmp_path / "sample"),
+              "partitions": {"num_workers": 1},
               "selection": {"events_per_process": selected, "seed": 21, "read_batch_size": 2}}
     path = tmp_path / "sample.yaml"
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
@@ -107,6 +108,10 @@ def test_cli_export_preserves_raw_schema_metadata_both_views_and_origins(tmp_pat
             torch.testing.assert_close(event.objects["PUPPIMET"].features, expected.objects["PUPPIMET"].features)
             assert origin["sha256"] == sha256_file(original_path)
         assert manifest["validation"][view]["events_checked"] == 18
+        from flowyforge.data_plugins.collide_v2.streaming import inspect_dataset
+        full_audit = inspect_dataset(stream_manifest, audit_events_per_class=9, read_batch_size=2)
+        merged = json.loads((output / "validation.json").read_text())[view]
+        assert {k: v for k, v in merged.items() if k != "scope"} == {k: v for k, v in full_audit.items() if k != "scope"}
     monkeypatch.setattr(sys, "argv", ["prepare_collide_source.py", "--config", str(config_path), "--stage", "inspect"])
     assert main() == 0
     before = (output / "sample_manifest.json").read_bytes()
@@ -279,3 +284,175 @@ def test_hf_selected_file_export_has_pinned_logical_origins(tmp_path, monkeypatc
         assert set(table[PREFIX + "source"].to_pylist()) == {"hf://datasets/example/collide"}
         assert set(table[PREFIX + "file"].to_pylist()) == {entry["input_file"]}
     assert all(Path(file["path"]).is_file() for file in manifest["source"]["files"])
+
+
+def memberships(manifest):
+    return {(process["name"], process["label"], e["id"], e["split"])
+            for process in manifest["processes"] for e in process["events"]}
+
+
+@pytest.mark.parametrize("workers", [1, 2, 4, 8])
+def test_fast_parallel_preparation_matches_strict_memberships(tmp_path, workers):
+    from flowyforge.data_plugins.collide_v2.streaming import load_partition_manifest
+    path, _ = fixture_config(tmp_path)
+    config = load_sample_config(path)
+    reference = prepare_sample(config)
+    original = load_partition_manifest(tmp_path / "sample/partitions.json")
+    config["output_dir"] = str(tmp_path / "parallel")
+    config["partitions"]["num_workers"] = workers
+    parallel = prepare_sample(config)
+    fast = load_partition_manifest(tmp_path / "parallel/partitions.json")
+    strict = create_partition_manifest({"root": config["output_dir"]}, seed=config["selection"]["seed"])
+    assert fast["version"] == 2 and fast["check_integrity_SHA256"] == "fast"
+    assert strict["version"] == 1
+    assert memberships(original) == memberships(fast) == memberships(strict)
+    assert fast["sha256"] != strict["sha256"]
+    assert all("content_sha256" not in e for p in fast["processes"] for e in p["events"])
+    for a, b in zip(reference["output_files"], parallel["output_files"]):
+        assert a["path"] == b["path"]
+        assert pq.read_table(tmp_path / "sample" / a["path"]).equals(pq.read_table(tmp_path / "parallel" / b["path"]))
+    for view in ("FullReco", "L1T"):
+        binding = bind_partition_manifest(fast, {"root": config["output_dir"]}, **config["readers"][view])
+        seen = set()
+        for split in ("train", "validation", "test"):
+            ids = {e.metadata["event_id"] for e in StreamingDataset(binding, split)}
+            expected = {identity for _, _, identity, part in memberships(fast) if part == split}
+            assert ids == expected and not seen.intersection(ids)
+            seen.update(ids)
+
+
+def test_fast_collects_origins_once_and_never_fingerprints_prepared_payloads(tmp_path, monkeypatch):
+    from flowyforge.data_plugins.collide_v2 import sample_preparation as prep, streaming
+    from flowyforge.data_plugins.collide_v2.provenance import with_origin
+    path, _ = fixture_config(tmp_path)
+    config = load_sample_config(path)
+    calls = []
+    real_hash = prep.sha256_file
+    def original_hash(path):
+        assert "originals" in Path(path).parts
+        calls.append(str(path))
+        return real_hash(path)
+    monkeypatch.setattr(prep, "sha256_file", original_hash)
+    def forbidden(*args, **kwargs):
+        pytest.fail("fast must not hash full prepared files or scan features again for partitions")
+    with monkeypatch.context() as context:
+        context.setattr(streaming, "_scan_partition_source", forbidden)
+        prepare_sample(config)
+    assert len(calls) == len(set(calls)) == 4  # Initial origin-v1 digest only.
+    monkeypatch.setattr(streaming, "sha256_file", forbidden)
+    fast = streaming.load_partition_manifest(tmp_path / "sample/partitions.json")
+    assert all(t["event_fingerprinting_seconds"] == 0 for t in json.loads((tmp_path / "sample/performance.json").read_text())["file_timings"])
+    # Moving bytes and preserving metadata is supported without trusting a cache path.
+    shutil.copytree(tmp_path / "sample", tmp_path / "moved")
+    for view in ("FullReco", "L1T"):
+        binding = bind_partition_manifest(fast, {"root": str(tmp_path / "moved")}, **config["readers"][view])
+        for _ in range(2):
+            assert len(list(StreamingDataset(binding, "train"))) == fast["split_counts"]["train"]
+    # An unsupported Python value in a physical column cannot be converted or hashed in fast records.
+    table = with_origin(pa.table({"opaque": [[1, 2]]}), {"source": "local", "revision": None,
+        "file": "file:///original", "process": "tt", "sha256": "a" * 64}, [0])
+    digest = streaming._json_digest
+    def no_event_fingerprint(value):
+        assert not isinstance(value, list)
+        return digest(value)
+    monkeypatch.setattr(streaming, "_json_digest", no_event_fingerprint)
+    assert len(streaming._event_records(table, "tt", policy="fast")) == 1
+
+
+def test_existing_prepared_partitions_stage_projects_only_origins(tmp_path, monkeypatch):
+    from flowyforge.data_plugins.collide_v2 import sample_preparation as prep, streaming
+    from scripts.prepare_collide_source import main
+    path, _ = fixture_config(tmp_path)
+    config = load_sample_config(path)
+    config["partitions"]["enabled"] = False
+    prepare_sample(config)
+    output = Path(config["output_dir"])
+    before = {p: p.read_bytes() for p in output.rglob("*.parquet")}
+    manifest_before = (output / "sample_manifest.json").read_bytes()
+    def forbidden(*args, **kwargs):
+        pytest.fail("partitions on prepared fast sample must not export, hash payloads or audit physical objects")
+    monkeypatch.setattr(prep, "sha256_file", forbidden)
+    monkeypatch.setattr(streaming, "sha256_file", forbidden)
+    monkeypatch.setattr(prep, "_export_file", forbidden)
+    monkeypatch.setattr(prep, "_validate_file", forbidden)
+    original_batches = pq.ParquetFile.iter_batches
+    def projected(self, *args, **kwargs):
+        assert set(kwargs["columns"]) == set(ORIGIN_COLUMNS)
+        yield from original_batches(self, *args, **kwargs)
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", projected)
+    monkeypatch.setattr(sys, "argv", ["prepare_collide_source.py", "--config", str(path), "--stage", "partitions"])
+    assert main() == 0
+    assert (output / "partitions.json").is_file()
+    assert manifest_before == (output / "sample_manifest.json").read_bytes()
+    assert all(p.read_bytes() == content for p, content in before.items())
+    with pytest.raises(FileExistsError, match="overwrite"):
+        prep.prepare_partitions(config)
+
+
+def test_fast_metadata_changes_duplicate_ids_and_invalid_policies_rejected(tmp_path):
+    import os
+    from flowyforge.data_plugins.collide_v2 import sample_preparation as prep, streaming
+    path, _ = fixture_config(tmp_path)
+    config = load_sample_config(path)
+    assert prep._partition_settings() == {"enabled": True, "check_integrity_SHA256": "fast",
+        "validation_fraction": .2, "test_fraction": .2, "read_batch_size": 2048, "num_workers": 4}
+    for value in ("FAST", True, "none"):
+        with pytest.raises(ValueError, match="exactly"):
+            prep._partition_settings({"check_integrity_SHA256": value})
+    with pytest.raises(ValueError, match="num_workers"):
+        prep._partition_settings({"num_workers": 3})
+    prepare_sample(config)
+    parts = streaming.load_partition_manifest(tmp_path / "sample/partitions.json")
+    file = next((tmp_path / "sample").rglob("*.parquet"))
+    stat = file.stat()
+    os.utime(file, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1000000000))
+    with pytest.raises(ValueError, match="metadata/schema changed"):
+        bind_partition_manifest(parts, {"root": config["output_dir"]}, **config["readers"]["FullReco"])
+    os.utime(file, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    shutil.copy2(file, file.with_name("duplicate.parquet"))
+    with pytest.raises(ValueError, match="Duplicate"):
+        create_partition_manifest({"root": config["output_dir"]}, check_integrity_SHA256="fast")
+    modified = json.loads(json.dumps(parts))
+    modified["processes"][0]["events"][0]["content_sha256"] = "0" * 64
+    modified["sha256"] = streaming._json_digest({k: v for k, v in modified.items() if k != "sha256"})
+    with pytest.raises(ValueError, match="must not claim"):
+        streaming.validate_partition_manifest(modified)
+
+
+def test_parallel_failure_joins_workers_and_removes_partial_outputs(tmp_path):
+    path, _ = fixture_config(tmp_path)
+    config = load_sample_config(path)
+    first = prepare_sample(config)
+    original_output = Path(config["output_dir"])
+    file = original_output / first["output_files"][-1]["path"]
+    table = pq.read_table(file)
+    table = table.set_column(table.schema.get_field_index(PREFIX + "process"), PREFIX + "process",
+                             pa.array(["wrong_process"] * len(table)))
+    pq.write_table(table, file)
+    config["source"]["processes"] = {name: str(original_output / name) for name in first["processes"]}
+    config["output_dir"] = str(tmp_path / "failed")
+    config["partitions"]["num_workers"] = 2
+    with pytest.raises(ValueError, match="Origin process"):
+        prepare_sample(config)
+    failed = tmp_path / "failed"
+    assert not list(failed.rglob("*.parquet")) and not list(failed.rglob("*.tmp"))
+    assert not (failed / "partitions.json").exists()
+    assert json.loads((failed / "sample_manifest.json").read_text())["status"] == "failed"
+    with pytest.raises(FileExistsError):
+        prepare_sample(config)
+
+
+def test_raw_fast_identity_uses_original_digest_then_reuses_metadata(tmp_path, monkeypatch):
+    from flowyforge.data_plugins.collide_v2 import streaming
+    path, _ = fixture_config(tmp_path)
+    config = load_sample_config(path)
+    strict = create_partition_manifest(config["source"])
+    fast = create_partition_manifest(config["source"], check_integrity_SHA256="fast")
+    assert memberships(fast) == memberships(strict)
+    assert all("origin_sha256" in f for p in fast["processes"] for f in p["files"])
+    def forbidden(*args, **kwargs):
+        pytest.fail("Original digest must be reused for raw fast binding after initial inventory")
+    monkeypatch.setattr(streaming, "sha256_file", forbidden)
+    for view in ("FullReco", "L1T"):
+        binding = bind_partition_manifest(fast, config["source"], **config["readers"][view])
+        assert len(list(StreamingDataset(binding, "train"))) == fast["split_counts"]["train"]

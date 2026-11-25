@@ -151,8 +151,10 @@ esistente; MET conserva l'ordine originale.
 
 ## Partizioni portabili opzionali
 
-Per condividere le stesse appartenenze fra viste e fasi usare
-`--stage partitions --partition-manifest PATH`, quindi passare quel file a
+La preparazione selected-file crea per default `partitions.json` fast v2;
+`prepare_collide_source.py --stage partitions` lo aggiunge a un export completo
+senza ripetere l’export. L’entrypoint storico del classificatore
+`--stage partitions --partition-manifest PATH` crea invece strict v1. Passare il file a
 `inspect` e `train`. La [procedura completa nel README](../README.md#partizioni-condivise-fra-fullreco-l1t-e-fasi-di-apprendimento)
 descrive creazione, opzioni, identità, API per pretraining e rilocazione.
 Gli esempi seguenti senza tale opzione mantengono il comportamento legacy.
@@ -162,9 +164,14 @@ seed, algoritmo, conteggi e checksum. La creazione non dipende dalla vista o dal
 reader. I run che lo usano salvano un binding `dataset_manifest.json` versione 2
 e una copia `partitions.json`; il checkpoint controlla entrambi attraverso i
 digest. `evaluate` può ricevere `--data-root NUOVA_RADICE`, verificando lo stesso
-insieme completo di eventi, anche dopo re-export con provenienza conservata.
-Le appartenenze non vengono ricampionate. Sono verificati SHA256 dei file e,
-per file riscritti, fingerprint dei contenuti/schema/metadati delle righe.
+insieme completo di eventi. Le appartenenze non vengono ricampionate.
+Strict v1 verifica SHA256 dei file e, per file riscritti, fingerprint dei
+contenuti/schema/metadati delle righe. Fast v2 controlla provenienza, identità,
+schema, dimensioni, conteggi e mtime; non calcola fingerprint dei valori né SHA256
+dei Parquet al binding o durante gli epoch. Conservare byte e timestamp in caso
+di rilocazione fast; per verificare re-export usare strict. Il checksum del
+manifest resta obbligatorio in entrambe le policy. Manifest SHA differenti non
+sono sostituibili in checkpoint/resume/encoder, anche con appartenenze uguali.
 
 Questa modalità richiede lettura raw iniziale e indici O(numero di eventi),
 anche con cap: i limiti di memoria del manifest implicito descritti sotto
@@ -339,9 +346,12 @@ già usati dal pretraining, ora condivisi. `last_checkpoint.pt` ha tipo
 dei metadati e dei tensori. Comprende stato Python/NumPy/Torch CPU e, sul device
 usato, CUDA o MPS, generatori train/validation, nomi ordinati dei parametri
 AdamW, momenti, epoca, history, diagnostica della prima epoca, provenienza,
-contratto, hash dei file/manifest e snapshot del best. Anche i manifest legacy
-v1 hanno qui un hash separato di ogni file per il controllo del resume; non
-viene modificato il loro algoritmo di campionamento né il reader.
+contratto, hash dei manifest e snapshot del best. Nei run legacy e strict v1
+si conserva anche un hash separato di ogni file per il controllo del resume.
+Con partizioni fast v2 `source_sha256` è una mappa vuota: l’integrità dei dati è
+quella della policy fast, non viene simulata una verifica dei payload. I digest
+esatti di binding/partizioni e i controlli dei metadati restano necessari. Il
+campionamento e le trasformazioni scientifiche sono invariati.
 
 L'ordine di salvataggio per epoca è `last_checkpoint.pt` atomico, poi
 `checkpoint.pt` atomico e `history.json`. Il primo è lo stato di riferimento:

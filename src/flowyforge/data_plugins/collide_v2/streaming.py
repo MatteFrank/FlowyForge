@@ -12,6 +12,10 @@ import json
 import math
 import os
 import random
+import time as clock
+import copy
+from contextlib import closing
+import tempfile
 from datetime import date, datetime, time
 from decimal import Decimal
 from collections.abc import Iterator, Mapping
@@ -24,6 +28,7 @@ import pyarrow.parquet as pq
 from torch.utils.data import IterableDataset, get_worker_info
 
 from flowyforge.core.typing import EventBatch
+from flowyforge.core.parallel import map_files
 from flowyforge.data_plugins.collide_v2.provenance import (
     ORIGIN_COLUMNS, event_id, logical_origin, pop_origin, provenance_columns, sha256_file,
 )
@@ -265,69 +270,128 @@ def _field_signature(field):
             sorted((key.hex(), value.hex()) for key, value in (field.metadata or {}).items())]
 
 
-def _scan_partition_source(source, *, read_batch_size=4, cached=None):
-    """Read all raw columns once; byte-identical files may reuse verified records.
+def _schema_digest(schema):
+    return _json_digest({
+        "fields": sorted((_field_signature(field) for field in schema
+                          if field.name not in ORIGIN_COLUMNS), key=lambda x: x[0]),
+        "metadata": sorted((key.hex(), value.hex()) for key, value in (schema.metadata or {}).items()),
+    })
 
-    Row fingerprints exclude only reserved origins. They include raw schema and
-    metadata, so re-encoding/reordering is accepted but dropped fields are not.
-    """
+
+def partition_policy(manifest):
+    """v1 always means strict; a policy flag cannot downgrade an old manifest."""
+    return "strict" if manifest["version"] == 1 else manifest["check_integrity_SHA256"]
+
+
+def _policy(value):
+    if value not in ("fast", "strict"):
+        raise ValueError("check_integrity_SHA256 must be exactly 'fast' or 'strict'.")
+    return value
+
+
+def _event_records(table, name, *, policy, digest=None, row_start=0, timing=None):
+    """Common export/scan records; fast projects origins BEFORE Python conversion."""
+    origins = provenance_columns(table.schema)
+    signature = _schema_digest(table.schema) if policy == "strict" else None
+    rows = table if policy == "strict" else table.select(origins)
+    records = []
+    for index, row in enumerate(rows.to_pylist()):
+        origin = pop_origin(row) or {"source": "local", "revision": None,
+            "process": name, "file": "sha256:" + digest, "row": row_start + index, "sha256": digest}
+        if origin["process"] != name:
+            raise ValueError(f"Origin process {origin['process']!r} differs from assigned process {name!r}.")
+        record = {"id": event_id(origin), "origin": logical_origin(origin)}
+        if policy == "strict":
+            started = clock.perf_counter()
+            record["content_sha256"] = _json_digest([signature, row])
+            if timing is not None:
+                timing["event_fingerprinting_seconds"] += clock.perf_counter() - started
+        records.append(record)
+    return records
+
+
+def _scan_partition_file(job):
+    name, path, policy, read_batch_size, previous = job
+    before = path.stat()
+    timing = {"event_fingerprinting_seconds": 0., "file_sha256_seconds": 0.}
+    with pq.ParquetFile(path) as parquet:
+        origins = provenance_columns(parquet.schema_arrow)
+        schema_digest = _schema_digest(parquet.schema_arrow)
+        digest, records = None, None
+        if policy == "strict" or not origins:
+            # Raw local identities need ONE content-addressed original. Later fast
+            # bindings may reuse it only with unambiguous matching file metadata.
+            candidates = [f for f in previous.get("files", []) if policy == "fast"
+                          and f.get("name") == path.name and f["size_bytes"] == before.st_size
+                          and f["mtime_ns"] == before.st_mtime_ns and f["schema_sha256"] == schema_digest]
+            if len(candidates) == 1:
+                digest = candidates[0].get("origin_sha256")
+            if digest is None:
+                if previous and policy == "fast" and not origins:
+                    raise ValueError(f"Fast raw source metadata changed/ambiguous: {path}; strict verification or new partitions required.")
+                started = clock.perf_counter()
+                digest = sha256_file(path)
+                timing["file_sha256_seconds"] = clock.perf_counter() - started
+        if policy == "strict":
+            known_files = {f["sha256"]: f for f in previous.get("files", [])}
+            if digest in known_files:
+                known_events = {e["id"]: e for e in previous["events"]}
+                records = [dict(known_events[key]) for key in known_files[digest]["event_ids"]]
+        if records is None:
+            records, row_start = [], 0
+            for batch in parquet.iter_batches(batch_size=read_batch_size, use_threads=False,
+                                              columns=None if policy == "strict" else origins):
+                # Zero-column Arrow batches preserve the row count for raw fast sources.
+                records.extend(_event_records(pa.Table.from_batches([batch]), name, policy=policy,
+                                              digest=digest, row_start=row_start, timing=timing))
+                row_start += len(batch)
+        if len(records) != parquet.metadata.num_rows:
+            raise ValueError(f"Cached partition row count differs: {path}")
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise ValueError(f"Source file changed during partition scan: {path}")
+    info = {"size_bytes": before.st_size, "num_rows": len(records), "event_ids": [e["id"] for e in records]}
+    if policy == "strict":
+        info["sha256"] = digest
+    else:
+        info.update(name=path.name, mtime_ns=before.st_mtime_ns, schema_sha256=schema_digest)
+        if not origins:
+            info["origin_sha256"] = digest  # Identity material, NOT a renewed content verification.
+    return name, path, info, records, timing
+
+
+def _scan_partition_source(source, *, read_batch_size=2048, cached=None,
+                           check_integrity_SHA256="strict", num_workers=1, performance=None):
+    """Strict: all values/file hashes. Fast: footer + provenance columns only."""
     if type(read_batch_size) is not int or read_batch_size < 1:
         raise ValueError("read_batch_size must be a positive integer.")
+    policy = _policy(check_integrity_SHA256)
     result, seen = [], set()
     cache = {process["name"]: process for process in (cached or {}).get("processes", [])}
-    for name, paths in _resolve_processes(source).items():
-        previous = cache.get(name, {})
-        known_files = {info["sha256"]: info for info in previous.get("files", [])}
-        known_events = {event["id"]: event for event in previous.get("events", [])}
-        events, files = [], []
-        for path in paths:
-            print(f"  Checking partition source: {name}/{path.name}", flush=True)
-            before = path.stat()
-            digest = sha256_file(path)
-            records = []
-            with pq.ParquetFile(path) as parquet:
-                provenance_columns(parquet.schema_arrow)
-                if digest in known_files:
-                    records = [dict(known_events[key]) for key in known_files[digest]["event_ids"]]
-                else:
-                    schema = parquet.schema_arrow
-                    signature = {
-                        "fields": sorted((_field_signature(field) for field in schema
-                                          if field.name not in ORIGIN_COLUMNS), key=lambda x: x[0]),
-                        "metadata": sorted((key.hex(), value.hex()) for key, value in (schema.metadata or {}).items()),
-                    }
-                    schema_digest = _json_digest(signature)
-                    row_index = 0
-                    for batch in parquet.iter_batches(batch_size=read_batch_size, use_threads=False):
-                        for row in batch.to_pylist():
-                            origin = pop_origin(row) or {"source": "local", "revision": None,
-                                "process": name, "file": "sha256:" + digest, "row": row_index, "sha256": digest}
-                            if origin["process"] != name:
-                                raise ValueError(f"Origin process {origin['process']!r} differs from assigned process {name!r}.")
-                            records.append({"id": event_id(origin), "origin": logical_origin(origin),
-                                            "content_sha256": _json_digest([schema_digest, row])})
-                            row_index += 1
-                            if row_index % 1000 == 0:
-                                print(f"    Fingerprinted {row_index:,}/{parquet.metadata.num_rows:,} rows", flush=True)
-                if len(records) != parquet.metadata.num_rows:
-                    raise ValueError(f"Cached partition row count differs: {path}")
-            after = path.stat()
-            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                raise ValueError(f"Source file changed during partition scan: {path}")
-            ids = [event["id"] for event in records]
+    paths_by_name = _resolve_processes(source)
+    grouped = {name: {"name": name, "paths": paths, "files": [], "events": []} for name, paths in paths_by_name.items()}
+    jobs = ((name, path, policy, read_batch_size, cache.get(name, {})) for name, paths in paths_by_name.items() for path in paths)
+    with closing(map_files(_scan_partition_file, jobs, num_workers)) as results:
+        for name, path, info, records, timing in results:
+            ids = info["event_ids"]
             if len(set(ids)) != len(ids) or seen.intersection(ids):
                 raise ValueError(f"Duplicate event identity in partition source: {path}")
             seen.update(ids)
-            files.append({"sha256": digest, "size_bytes": before.st_size, "num_rows": len(ids), "event_ids": ids})
-            events.extend(records)
-            print(f"  Partition inventory {name}: {path.name}, {len(ids):,} rows", flush=True)
-        result.append({"name": name, "paths": paths, "files": files,
-                       "events": sorted(events, key=lambda event: event["id"])})
+            grouped[name]["files"].append(info)
+            grouped[name]["events"].extend(records)
+            if performance is not None:
+                for key, value in timing.items():
+                    performance[key] = performance.get(key, 0.) + value
+            print(f"  Partition inventory {name}: {path.name}, {len(ids):,} rows ({policy})", flush=True)
+    for process in grouped.values():
+        process["events"].sort(key=lambda event: event["id"])
+        result.append(process)
     return result
 
 
 def create_partition_manifest(source: Mapping[str, Any], *, seed=42, validation_fraction=0.2,
-                              test_fraction=0.2, read_batch_size=4) -> dict[str, Any]:
+                              test_fraction=0.2, read_batch_size=2048, check_integrity_SHA256="strict",
+                              num_workers=1, performance=None, _collected=None) -> dict[str, Any]:
     """Freeze source-row memberships once, without a view or object reader.
 
     The current COLLIDE reader has no verified physical-ID contract. Identity is
@@ -341,15 +405,20 @@ def create_partition_manifest(source: Mapping[str, Any], *, seed=42, validation_
     cap = source.get("max_events_per_class")
     if cap is not None and (type(cap) is not int or cap < 3):
         raise ValueError("max_events_per_class must be >= 3 or null.")
-    processes = _scan_partition_source(source, read_batch_size=read_batch_size)
-    manifest = {"kind": "flowyforge.event_partitions", "version": 1, "algorithm": PARTITION_ALGORITHM,
+    policy = _policy(check_integrity_SHA256)
+    processes = copy.deepcopy(_collected) if _collected is not None else _scan_partition_source(
+        source, read_batch_size=read_batch_size, check_integrity_SHA256=policy, num_workers=num_workers, performance=performance)
+    manifest = {"kind": "flowyforge.event_partitions", "version": 1 if policy == "strict" else 2, "algorithm": PARTITION_ALGORITHM,
                 "identity": "origin-v1", "physical_deduplication": False, "seed": seed,
                 "validation_fraction": validation_fraction, "test_fraction": test_fraction,
                 "max_events_per_class": cap, "processes": processes, "label_map": {},
                 "split_counts": dict.fromkeys(SPLITS, 0)}
+    if policy == "fast":
+        manifest["check_integrity_SHA256"] = "fast"
     for label, process in enumerate(processes):
-        process.pop("paths")  # Physical locations never enter the portable artifact.
-        process["files"].sort(key=lambda info: info["sha256"])
+        process.pop("paths", None)  # Physical locations never enter the portable artifact.
+        process["files"].sort(key=lambda info: info["sha256"] if policy == "strict" else info["event_ids"])
+        process["events"].sort(key=lambda event: event["id"])
         name, events = process["name"], process["events"]
         total = len(events)
         count = min(total, cap) if cap is not None else total
@@ -372,13 +441,16 @@ def create_partition_manifest(source: Mapping[str, Any], *, seed=42, validation_
 
 def validate_partition_manifest(manifest):
     """Reject unknown versions, damaged identities, counts or memberships."""
-    if not isinstance(manifest, dict) or (manifest.get("kind"), manifest.get("version"), manifest.get("algorithm")) != (
-        "flowyforge.event_partitions", 1, PARTITION_ALGORITHM
-    ):
-        raise ValueError("Unsupported partition manifest kind/version/algorithm; create a separate v1 partition manifest.")
+    if (not isinstance(manifest, dict) or manifest.get("kind") != "flowyforge.event_partitions"
+        or manifest.get("version") not in (1, 2) or manifest.get("algorithm") != PARTITION_ALGORITHM):
+        raise ValueError("Unsupported partition manifest kind/version/algorithm; supported: strict v1, fast v2.")
     if manifest.get("sha256") != _json_digest({key: value for key, value in manifest.items() if key != "sha256"}):
         raise ValueError("Partition manifest checksum mismatch; do not edit saved memberships.")
     try:
+        policy = partition_policy(manifest)
+        if ((manifest["version"] == 1 and manifest.get("check_integrity_SHA256", "strict") != "strict")
+            or (manifest["version"] == 2 and policy != "fast")):
+            raise ValueError("Partition version/integrity policy mismatch; strict v1 cannot be downgraded.")
         seen, totals, labels = set(), dict.fromkeys(SPLITS, 0), {}
         if manifest["identity"] != "origin-v1" or manifest["physical_deduplication"] is not False:
             raise ValueError("Unsupported partition identity policy.")
@@ -398,8 +470,10 @@ def validate_partition_manifest(manifest):
                 key = event["id"]
                 if key in seen or key != event_id(event["origin"]) or event["origin"]["process"] != process["name"]:
                     raise ValueError("Duplicate or invalid partition event identity.")
-                if len(event["content_sha256"]) != 64 or any(c not in "0123456789abcdef" for c in event["content_sha256"]):
+                if policy == "strict" and (len(event["content_sha256"]) != 64 or any(c not in "0123456789abcdef" for c in event["content_sha256"])):
                     raise ValueError("Invalid partition event fingerprint.")
+                if policy == "fast" and "content_sha256" in event:
+                    raise ValueError("Fast partitions must not claim per-event content verification.")
                 seen.add(key)
                 ids.add(key)
                 if event["split"] is not None:
@@ -410,9 +484,17 @@ def validate_partition_manifest(manifest):
                 raise ValueError("Inconsistent partition split counts.")
             file_ids = []
             for info in process["files"]:
+                fingerprint = info["sha256"] if policy == "strict" else info["schema_sha256"]
                 if (len(info["event_ids"]) != info["num_rows"] or info["size_bytes"] < 0 or
-                    len(info["sha256"]) != 64 or any(c not in "0123456789abcdef" for c in info["sha256"])):
+                    len(fingerprint) != 64 or any(c not in "0123456789abcdef" for c in fingerprint)):
                     raise ValueError("Invalid partition file inventory.")
+                if policy == "fast":
+                    if (type(info["mtime_ns"]) is not int or info["mtime_ns"] < 0 or not info["name"]
+                        or Path(info["name"]).name != info["name"] or "sha256" in info):
+                        raise ValueError("Invalid fast file metadata (no full-file verification claimed).")
+                    if "origin_sha256" in info and (len(info["origin_sha256"]) != 64 or
+                            any(c not in "0123456789abcdef" for c in info["origin_sha256"])):
+                        raise ValueError("Invalid original identity checksum.")
                 file_ids.extend(info["event_ids"])
             if len(file_ids) != len(ids) or set(file_ids) != ids:
                 raise ValueError("Partition file inventory differs from event identities.")
@@ -429,9 +511,17 @@ def save_partition_manifest(manifest, path):
     validate_partition_manifest(manifest)
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2, allow_nan=False)
-        handle.write("\n")
+    # Publish a fully written artifact atomically, while refusing concurrent overwrite.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(manifest, handle, indent=2, allow_nan=False)
+            handle.write("\n")
+        os.link(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def load_partition_manifest(path):
@@ -440,7 +530,7 @@ def load_partition_manifest(path):
     return manifest
 
 
-def bind_partition_manifest(partitions, source, *, read_batch_size=4, **reader_settings):
+def bind_partition_manifest(partitions, source, *, read_batch_size=2048, **reader_settings):
     """Resolve immutable memberships onto current files and one object view.
 
     Re-exports must contain the same complete event universe and raw payloads.
@@ -450,7 +540,9 @@ def bind_partition_manifest(partitions, source, *, read_batch_size=4, **reader_s
     cap = source.get("max_events_per_class")
     if cap is not None and cap != partitions["max_events_per_class"]:
         raise ValueError("Sample cap differs from partition manifest; remove the override or use its original cap.")
-    current = _scan_partition_source(source, read_batch_size=read_batch_size, cached=partitions)
+    policy = partition_policy(partitions)
+    current = _scan_partition_source(source, read_batch_size=read_batch_size, cached=partitions,
+                                     check_integrity_SHA256=policy)
     if [p["name"] for p in current] != [p["name"] for p in partitions["processes"]]:
         raise ValueError("Partition source processes changed.")
     reader = _reader_config(**reader_settings)
@@ -458,22 +550,35 @@ def bind_partition_manifest(partitions, source, *, read_batch_size=4, **reader_s
                "partition_sha256": partitions["sha256"], "reader": reader,
                "validation_fraction": partitions["validation_fraction"], "test_fraction": partitions["test_fraction"],
                "label_map": dict(partitions["label_map"]), "split_counts": dict(partitions["split_counts"]), "processes": []}
+    if policy == "fast":
+        binding["check_integrity_SHA256"] = "fast"
     task_id = 0
     for stored, actual in zip(partitions["processes"], current):
         expected = {event["id"]: event for event in stored["events"]}
         found = {event["id"]: event for event in actual["events"]}
         if expected.keys() != found.keys():
             raise ValueError(f"Partition source identities changed for {stored['name']}: missing/extra original rows.")
-        if any(event["content_sha256"] != found[key]["content_sha256"] for key, event in expected.items()):
+        if policy == "strict" and any(event["content_sha256"] != found[key]["content_sha256"] for key, event in expected.items()):
             raise ValueError(f"Partition source content/schema changed for {stored['name']}.")
+        if policy == "fast":
+            inventories = {tuple(f["event_ids"]): f for f in stored["files"]}
+            for info in actual["files"]:
+                old = inventories.get(tuple(info["event_ids"]))
+                if old is None or any(info[k] != old[k] for k in ("size_bytes", "mtime_ns", "schema_sha256", "num_rows")):
+                    raise ValueError(f"Fast partition file metadata/schema changed for {stored['name']}; "
+                                     "preserve files/timestamps on relocation or create new partitions. No content equivalence inferred.")
         files, indices, total = [], {split: [] for split in SPLITS}, 0
         for path, inventory in zip(actual["paths"], actual["files"]):
             stat = path.stat()
+            if policy == "fast" and (stat.st_size != inventory["size_bytes"] or stat.st_mtime_ns != inventory["mtime_ns"]):
+                raise ValueError(f"Source file changed during fast partition binding: {path}")
             with pq.ParquetFile(path) as parquet:
                 info = _schema_info(parquet.schema_arrow, reader, path)
                 groups = [parquet.metadata.row_group(i).num_rows for i in range(parquet.num_row_groups)]
                 files.append({**inventory, **info, "path": str(path), "offset": total,
                               "mtime_ns": stat.st_mtime_ns, "row_groups": groups, "task_offset": task_id})
+                if policy == "fast":
+                    files[-1]["check_integrity_SHA256"] = "fast"
                 task_id += len(groups)
             for row_index, key in enumerate(inventory["event_ids"]):
                 split = expected[key]["split"]
@@ -492,6 +597,12 @@ def _check_file(info: dict[str, Any]) -> None:
         raise ValueError(f"Source file changed since manifest creation: {info['path']}")
     if "sha256" in info and sha256_file(info["path"]) != info["sha256"]:
         raise ValueError(f"Source file content changed since partition binding: {info['path']}")
+    if info.get("check_integrity_SHA256") == "fast":
+        with pq.ParquetFile(info["path"]) as parquet:
+            provenance_columns(parquet.schema_arrow)
+            if (parquet.metadata.num_rows != info["num_rows"] or
+                _schema_digest(parquet.schema_arrow) != info["schema_sha256"]):
+                raise ValueError(f"Fast source schema/row count changed: {info['path']}")
 
 
 def _raw_stats(row: dict[str, Any]) -> dict[str, Any]:
@@ -574,8 +685,9 @@ def _iter_process(process, tasks, split, reader, read_batch_size, *, audit=False
                             raise ValueError(f"{info['path']}, row {int(index) - info['offset']}: {exc}") from exc
                         event.metadata.update(source_file=info["path"], source_row=int(index) - info["offset"], process_name=process["name"])
                         if origin is None and "event_ids" in info:
+                            original_digest = info.get("origin_sha256", info.get("sha256"))
                             origin = {"source": "local", "revision": None, "process": process["name"],
-                                      "file": "sha256:" + info["sha256"], "sha256": info["sha256"],
+                                      "file": "sha256:" + original_digest, "sha256": original_digest,
                                       "row": int(index) - info["offset"]}
                         if origin is not None:
                             event.metadata["origin"] = origin
@@ -694,12 +806,19 @@ def inspect_dataset(manifest, *, audit_events_per_class=32, read_batch_size=128,
                 for key, fn in (("min", min), ("max", max)):
                     if stats[key] is not None:
                         total[key] = stats[key] if total[key] is None else fn(total[key], stats[key])
+    result["warnings"] = _audit_warnings(result)
+    return result
+
+
+def _audit_warnings(result):
+    """Warnings from final totals (also used after merging per-file audits)."""
+    warnings = []
     if result["unit_assumed_fields"]:
-        result["warnings"].append(f"Units are configuration assumptions for {result['unit_assumed_fields']} file/field entries without recognized metadata; inspect raw ranges and confirm the production convention.")
+        warnings.append(f"Units are configuration assumptions for {result['unit_assumed_fields']} file/field entries without recognized metadata; inspect raw ranges and confirm the production convention.")
     for name, totals in result["collections"].items():
         if totals["truncated_events"] or totals["nonfinite_values_replaced"] or totals["missing_optional_events"]:
-            result["warnings"].append(f"{name} audit: {totals['truncated_events']} truncated events, {totals['nonfinite_values_replaced']} nonfinite values replaced, {totals['missing_optional_events']} events with missing optional fields.")
-    return result
+            warnings.append(f"{name} audit: {totals['truncated_events']} truncated events, {totals['nonfinite_values_replaced']} nonfinite values replaced, {totals['missing_optional_events']} events with missing optional fields.")
+    return warnings
 
 
 __all__ = ["build_manifest", "inspect_dataset", "StreamingDataset", "create_partition_manifest",

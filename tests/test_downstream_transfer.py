@@ -138,7 +138,10 @@ def test_reject_incompatible_encoder_contract_or_weights(pilot, tmp_path, mismat
 
 
 def test_configuration_validation_and_legacy_head(pilot):
-    legacy = runner.load_run_config(REPO / "configs/runs/collide_supervised.yaml")
+    # The editable main configs have different horizons (supervised 24/downstream 3).
+    # Compare the resolved common protocol without resetting the user's defaults.
+    common = {"epochs": 2}
+    legacy = runner.load_run_config(REPO / "configs/runs/collide_supervised.yaml", common)
     assert "downstream" not in legacy
     torch.manual_seed(42)
     model = runner._make_model(legacy, {"background": 0, "signal": 1})
@@ -154,7 +157,7 @@ def test_configuration_validation_and_legacy_head(pilot):
     with pytest.raises(ValueError, match="downstream.mode"):
         runner.load_run_config(pilot[1], {"downstream_mode": "unknown"})
     for view in ("FullReco", "L1T"):
-        config = runner.load_run_config(REPO / "configs/runs/collide_downstream.yaml", {"view": view})
+        config = runner.load_run_config(REPO / "configs/runs/collide_downstream.yaml", {**common, "view": view})
         assert config["model"] == legacy["model"]
         assert config["training"] == legacy["training"]
         assert config["partition_manifest"] == legacy["partition_manifest"]
@@ -338,3 +341,111 @@ def test_comparison_rejects_independently_valid_but_different_experiments(benchm
     with pytest.raises(ValueError, match=expected):
         compare_downstream_runs([paths["FullReco"][0], paths["FullReco"][1], Path(config["output_dir"])], tmp_path / "invalid_comparison")
     assert not (tmp_path / "invalid_comparison").exists()
+
+
+def test_prepared_fast_and_strict_full_pipeline_share_scientific_memberships(tmp_path, monkeypatch):
+    """Both views × both policies × three modes; one tiny CPU epoch, synthetic data."""
+    from flowyforge.data_plugins.collide_v2.sample_preparation import load_sample_config, prepare_sample
+    from flowyforge.data_plugins.collide_v2.streaming import load_partition_manifest
+    from flowyforge.training import pretraining_run
+    from flowyforge.data_plugins.collide_v2 import streaming
+    make_tiny_parquet_sample(tmp_path / "raw", events_per_class=16, files_per_class=2)
+    model_path = tmp_path / "model.yaml"
+    model_path.write_text(yaml.safe_dump({"model": {"embedding_dim": 8, "num_latents": 2, "num_heads": 2,
+        "num_layers": 1, "output_dim": 8, "dropout": 0.}, "data": {"collection_limits": {
+        "PUPPIPart": 8, "JetPuppiAK4": 3, "Electron": 2, "MuonTight": 2, "PhotonTight": 2, "PUPPIMET": 1}}}))
+    memberships = []
+    manifest_hashes = []
+    real_loader = pretraining_run._loader
+    def train_validation_only(manifest, config, split, **kwargs):
+        assert split in ("train", "validation")
+        assert kwargs["purpose"] == ("pretraining" if split == "train" else "checkpoint_selection")
+        return real_loader(manifest, config, split, **kwargs)
+    monkeypatch.setattr(pretraining_run, "_loader", train_validation_only)
+    real_epoch = runner._run_epoch
+    observed = []
+    def train_then_final_test(model, loader, *args, **kwargs):
+        split = loader.dataset.split
+        observed.append((split, kwargs.get("optimizer") is not None))
+        if split == "test":
+            assert not kwargs.get("optimizer")
+            assert sum(s == "validation" for s, _ in observed) == 2
+        return real_epoch(model, loader, *args, **kwargs)
+    monkeypatch.setattr(runner, "_run_epoch", train_then_final_test)
+    for policy in ("fast", "strict"):
+        directory = tmp_path / policy
+        sample_path = tmp_path / f"sample_{policy}.yaml"
+        sample_path.write_text(yaml.safe_dump({"source": {"kind": "local", "processes": {
+            n: str(tmp_path / "raw" / n) for n in ("background", "signal")}},
+            "output_dir": str(directory / "data"), "model_config": str(model_path),
+            "selection": {"events_per_process": 16, "seed": 42, "read_batch_size": 8},
+            "partitions": {"check_integrity_SHA256": policy, "num_workers": 1}}))
+        prepare_sample(load_sample_config(sample_path))
+        parts_path = directory / "data/partitions.json"
+        parts = load_partition_manifest(parts_path)
+        if policy == "strict":
+            assert create_partition_manifest({"root": str(directory / "data")}) == parts
+        memberships.append({(p["name"], p["label"], e["id"], e["split"]) for p in parts["processes"] for e in p["events"]})
+        manifest_hashes.append(parts["sha256"])
+        raw = {"model_config": str(model_path), "partition_manifest": str(parts_path), "seed": 42,
+               "sources": {"small": {"processes": {n: str(directory / "data" / n) for n in ("background", "signal")}, "max_events_per_class": None}},
+               "data": {"read_batch_size": 8, "shuffle_buffer": 4, "audit_events_per_class": 2},
+               "training": {"epochs": 1, "batch_size": 8, "device": "cpu", "cpu_threads": 1},
+               "evaluation": {"signal_process": "signal", "background_acceptance": .5,
+                              "min_background_events": 1, "score_shard_rows": 4}}
+        downstream_path = directory / "run.yaml"
+        downstream_path.write_text(yaml.safe_dump(raw))
+        pretrain_raw = {**raw, "pretraining": {"probability": .5, "decoder_hidden_dim": 8},
+                        "reporting": {"inference": False}}
+        pretrain_path = directory / "pretrain.yaml"
+        pretrain_path.write_text(yaml.safe_dump(pretrain_raw))
+        with monkeypatch.context() as guards:
+            if policy == "fast":
+                def no_data_hash(path):
+                    assert not Path(path).resolve().is_relative_to((directory / "data").resolve())
+                    return sha256_file(path)
+                guards.setattr(streaming, "sha256_file", no_data_hash)
+                guards.setattr(runner, "sha256_file", no_data_hash)
+            for view in ("FullReco", "L1T"):
+                encoder_path = directory / f"pretrain_{view}/encoder.pt"
+                pre = load_pretraining_config(pretrain_path, {"view": view, "output_dir": str(encoder_path.parent)})
+                pre_metrics = run_pretraining(pre)
+                assert pre_metrics["test_used"] is False
+                payload = torch.load(encoder_path, weights_only=True)
+                assert payload["provenance"]["partition_sha256"] == parts["sha256"]
+                assert payload["provenance"]["pretraining_split"] == "train"
+                outputs = []
+                for mode in MODES:
+                    observed.clear()
+                    output = directory / f"{view}_{mode}"
+                    overrides = {"view": view, "downstream_mode": mode, "output_dir": str(output)}
+                    if mode != "scratch":
+                        overrides["encoder_checkpoint"] = str(encoder_path)
+                    cfg = runner.load_run_config(downstream_path, overrides)
+                    metrics = runner.run_classification(cfg)
+                    assert observed[-1] == ("test", False) and sum(s == "test" for s, _ in observed) == 1
+                    assert all(s == "train" for s, optimize in observed if optimize)
+                    for split in ("validation", "test"):
+                        _, ids, labels, _ = read_evaluation_scores(output / metrics[split]["score_manifest"])
+                        assert dict(zip(ids, labels.tolist())) == {e["id"]: p["label"] for p in parts["processes"]
+                            for e in p["events"] if e["split"] == split}
+                    outputs.append(output)
+                compare_downstream_runs(outputs, directory / f"comparison_{view}")
+                assert (directory / f"comparison_{view}/comparison.html").is_file()
+                if policy == "fast" and view == "FullReco":
+                    observed.clear()
+                    resume_config = runner.load_run_config(downstream_path, {"view": view,
+                        "downstream_mode": "linear_probe", "encoder_checkpoint": str(encoder_path),
+                        "output_dir": str(outputs[1]), "epochs": 2})
+                    resumed = runner.run_classification(resume_config, resume=outputs[1] / "last_checkpoint.pt")
+                    assert len(resumed["history"]) == 2
+                    saved = torch.load(outputs[1] / "last_checkpoint.pt", weights_only=True)
+                    assert saved["source_sha256"] == {}  # No invented full-data checksums.
+        if policy == "strict":
+            # Equal memberships do not authorize silently substituting the manifest SHA in encoder provenance.
+            cfg = runner.load_run_config(downstream_path, {"downstream_mode": "linear_probe", "view": "FullReco",
+                "encoder_checkpoint": str(tmp_path / "fast/pretrain_FullReco/encoder.pt"),
+                "output_dir": str(directory / "incompatible_policy")})
+            with pytest.raises(ValueError, match="provenance"):
+                runner.run_classification(cfg, inspect_only=True)
+    assert memberships[0] == memberships[1] and manifest_hashes[0] != manifest_hashes[1]

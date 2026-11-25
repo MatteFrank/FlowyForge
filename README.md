@@ -246,11 +246,16 @@ campione preparato che contiene già le colonne di provenienza.
 | `source.max_download_bytes` | Solo HF: massimo totale dei file selezionati, verificato prima del download |
 | `output_dir` | Directory nuova o vuota per il campione; default `data/processed/collide_pilot` |
 | `selection.events_per_process` | Eventi richiesti per processo, default 5.000, minimo 3, senza limite di 100 |
-| `selection.seed` | Seed non negativo della selezione entro i file scelti |
+| `selection.seed` | Seed non negativo della selezione entro i file scelti e delle partizioni |
 | `selection.read_batch_size` | Righe per batch Arrow, default 64; non è il batch del modello |
 | `model_config` | YAML del modello, risolto rispetto al config di preparazione; da qui provengono limiti/contratto delle collections |
 | `reader.units` | Unità degli input, default GeV/rad; non riscrive i dati grezzi |
 | `reader.collection_limits`, `reader.eta_clip`, `reader.value_clip` | Override del contratto per la validazione; devono corrispondere al successivo config di run |
+| `partitions.enabled` | Default `true`: crea `partitions.json` durante l'export. `false` conserva il percorso di sola preparazione; lo stadio esplicito `partitions` crea comunque gli split |
+| `partitions.check_integrity_SHA256` | Esattamente `fast` (default) oppure `strict`; governa anche i controlli dell'export |
+| `partitions.validation_fraction`, `partitions.test_fraction` | Default 0.2 ciascuna; train è il resto. Almeno un evento per split/processo |
+| `partitions.read_batch_size` | Default 2048: batch di provenienza nello stadio `partitions` su un export già completo |
+| `partitions.num_workers` | Default 4; valori 1, 2, 4, 8. Processi per file nell'export/audit e nella creazione separata delle partizioni; non sono worker del DataLoader |
 
 Gli altri percorsi relativi sono risolti dalla directory di lavoro: usare la
 radice del repository. Per Windows sono validi percorsi come `D:/collide/...`;
@@ -272,6 +277,161 @@ troncati dal reader. Il troncamento riguarda la rappresentazione del modello:
 gli oggetti nel Parquet esportato restano completi. Questi controlli software
 non sostituiscono la verifica delle convenzioni fisiche della produzione.
 
+### Policy di integrità e parallelismo della preparazione
+
+I tre YAML `collide_pilot_hf`, `collide_pilot_local` e `collide_terabit` includono:
+
+```yaml
+partitions:
+  enabled: true
+  check_integrity_SHA256: fast
+  validation_fraction: 0.2
+  test_fraction: 0.2
+  read_batch_size: 2048
+  num_workers: 4
+```
+
+`prepare` conserva la selezione preesistente e raccoglie identità e provenienza
+mentre copia le righe. Il processo principale assegna gli split dopo l'audit di
+entrambi i reader, senza una seconda scansione fisica per crearli. Ogni worker
+esporta e valida un file indipendente; solo il padre scrive i manifest. I nomi
+dei file e l'ordine di aggregazione sono deterministici. Al massimo N lavori
+sono in volo; i worker avviati con spawn limitano Arrow e Torch a un thread.
+L'identità e gli split non dipendono dal numero di worker. Con due file soltanto,
+oltre due worker non aggiungono parallelismo utile.
+
+In caso di errore si attendono i worker attivi, si rimuovono i soli shard creati
+nel nuovo output e si registra `status: failed`. I file originali e gli output
+precedenti non vengono cancellati. Il manifest delle partizioni è pubblicato
+atomicamente con creazione esclusiva. Un arresto forzato del nodo può lasciare
+un output `preparing`: non usarlo per training né rilanciare sopra la directory.
+
+| Controllo | Fast, partizioni v2 | Strict, partizioni v1 |
+| --- | --- | --- |
+| Identità `origin-v1`, seed, etichette, algoritmo di split | Uguali | Uguali |
+| Checksum del manifest e disgiunzione degli split | Sì | Sì |
+| Provenienza completa, ID duplicati, schema, righe, dimensioni | Sì | Sì |
+| Timestamp dei file al binding | Conservazione richiesta | Nuovo binding ammesso dopo verifica dei contenuti |
+| SHA256 iniziale di un originale locale senza provenienza | Una volta, necessario all'identità | Sì |
+| SHA256 degli export e scansioni SHA256 successive del dataset | No | Sì |
+| Fingerprint `content_sha256` per evento | Assente, nessun hash fittizio | Tutti i valori raw e schema |
+| Rilevamento di modifiche arbitrarie a parità di metadati | Non garantito | Verifica completa |
+
+Il digest dello schema/manifest è piccolo e resta presente in fast: non è un
+hash del payload Parquet. Le colonne `origin_sha256` indicano l'originale,
+non certificano il contenuto attuale dell'export. Anche in fast la preparazione
+valida tutti gli eventi nelle due viste; il vantaggio riguarda fingerprint,
+riletture per le partizioni e parallelismo, non l'eliminazione dell'audit fisico.
+Su un vecchio export senza timestamp salvati, lo stadio fast `partitions` adotta
+i metadati attuali dopo aver verificato l'inventario, senza verificare i vecchi
+checksum dei payload: scegliere strict se serve quella garanzia.
+
+A parità di sorgente, selezione, seed e frazioni, fast e strict hanno identiche
+appartenenze scientifiche, ma **SHA256 di manifest diversi**. Training, resume,
+encoder e confronti continuano a richiedere lo stesso manifest esatto: il riuso
+di un encoder fra policy diverse viene rifiutato. Nessuna deduplicazione fisica
+fra HF ed EOS è inferita.
+
+`performance.json` e `sample_manifest.json.performance` riportano wall time,
+eventi/s, discovery, export, raccolta delle identità, fingerprint, validazione,
+hash originali/output e picchi RSS per processo. I tempi dei file sono somme di
+wall time dei worker e possono sovrapporsi; il tempo dei fingerprint è contenuto
+nella raccolta delle partizioni. RSS è il picco di vita del processo, non il
+picco simultaneo dell'intero job. Lo stadio separato produce
+`partition_performance.json`. Ridurre `selection.read_batch_size` o i worker
+se i grandi eventi nested consumano troppa RAM; il default di export rimane 64.
+
+### TERABIT/CNAF: un solo job per preparazione e split
+
+Da `ui-terabit.cr.cnaf.infn.it`, nella radice FlowyForge e con la venv già
+installata sul cluster, verificare `configs/data/collide_terabit.yaml`: le due
+directory sotto `/storage-hpc/kamiknows/flowyforge_data/subsetCollide/` devono
+contenere **solo i file selezionati** (oppure elencare i 10 file esplicitamente
+per processo). Il config richiede 50.000 eventi per processo; la selezione è
+uniforme entro questi file, non nell'intero dataset. Non usarlo per sovrascrivere
+un export già presente.
+
+```bash
+# Solo discovery/footer: nessun download, export o training.
+.venv/bin/python scripts/prepare_collide_source.py --config configs/data/collide_terabit.yaml --stage plan
+mkdir -p outputs/slurm_logs
+
+# NUOVO export: 4 processi per file, una sola invocazione Python, nessun array/merge.
+# 6 CPU lasciano spazio al padre; 32G e 2h sono richieste iniziali da dimensionare
+# sulla memoria reale degli eventi. Il lavoro non richiede GPU.
+prepare_job=$(sbatch --parsable --account=kamiknows --qos=kamiknows \
+  --partition=bare-metal-nodes --nodes=1 --ntasks=1 --cpus-per-task=6 \
+  --mem=32G --time=02:00:00 --job-name=ff-prepare \
+  --output=outputs/slurm_logs/%x-%j.out --error=outputs/slurm_logs/%x-%j.err \
+  --wrap='set -eu; export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1; hostname; date -u; srun --ntasks=1 --cpus-per-task=6 --cpu-bind=cores .venv/bin/python scripts/prepare_collide_source.py --config configs/data/collide_terabit.yaml --stage prepare; date -u')
+prepare_job=${prepare_job%%;*}
+bash scripts/slurm/status.sh "$prepare_job"
+```
+
+Se `data/processed/collide_terabit/sample_manifest.json` è già `complete` e
+manca soltanto `partitions.json`, eseguire **in alternativa**:
+
+```bash
+mkdir -p outputs/slurm_logs
+partition_job=$(sbatch --parsable --account=kamiknows --qos=kamiknows \
+  --partition=bare-metal-nodes --nodes=1 --ntasks=1 --cpus-per-task=6 \
+  --mem=16G --time=01:00:00 --job-name=ff-partitions \
+  --output=outputs/slurm_logs/%x-%j.out --error=outputs/slurm_logs/%x-%j.err \
+  --wrap='set -eu; export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1; srun --ntasks=1 --cpus-per-task=6 --cpu-bind=cores .venv/bin/python scripts/prepare_collide_source.py --config configs/data/collide_terabit.yaml --stage partitions')
+partition_job=${partition_job%%;*}
+bash scripts/slurm/status.sh "$partition_job"
+```
+
+Entrambi rifiutano sovrascritture. Per 8 worker cambiare il YAML, l'allocazione
+CPU e `srun` coerentemente; non avviare più job sulla stessa directory. Consultare
+`.out`, `.err`, `sacct` tramite `status.sh` e lo stato del manifest. Il job finito
+con codice zero non sostituisce il controllo degli avvisi sulle unità/collections.
+Dopo il completamento, ispezione bounded e avvio esplicito dei run separati:
+
+```bash
+# Override espliciti evitano di mescolare il pilot con il dataset TERABIT.
+.venv/bin/python scripts/run_classification.py --config configs/runs/collide_pilot.yaml --stage inspect --mode eos --data-root data/processed/collide_terabit --max-events-per-class 0 --partition-manifest data/processed/collide_terabit/partitions.json --view FullReco --output-dir outputs/terabit/preflight_fullreco
+.venv/bin/python scripts/run_classification.py --config configs/runs/collide_pilot.yaml --stage inspect --mode eos --data-root data/processed/collide_terabit --max-events-per-class 0 --partition-manifest data/processed/collide_terabit/partitions.json --view L1T --output-dir outputs/terabit/preflight_l1t
+
+# Allenamento opzionale: stesso manifest, una GPU per vista, output distinti.
+sbatch --partition=bare-metal-GPU --gres=gpu:1 --array=0-1%2 --job-name=ff-pretrain scripts/slurm/run.sbatch pretraining configs/runs/collide_pretraining.yaml outputs/terabit/pretraining cuda --mode eos --data-root data/processed/collide_terabit --max-events-per-class 0 --partition-manifest data/processed/collide_terabit/partitions.json
+# Dopo il pretraining: modificare linear_probe in finetune e scegliere un'altra root.
+sbatch --partition=bare-metal-GPU --gres=gpu:1 --array=0-1%2 --job-name=ff-probe scripts/slurm/run.sbatch classification configs/runs/collide_downstream.yaml outputs/terabit/linear_probe cuda --mode eos --data-root data/processed/collide_terabit --max-events-per-class 0 --partition-manifest data/processed/collide_terabit/partitions.json --downstream-mode linear_probe --encoder-checkpoint 'outputs/terabit/pretraining/{view}/encoder.pt'
+```
+
+La preparazione non sottomette automaticamente alcun training. Questi comandi
+Slurm sono forniti per CNAF con account/QoS `kamiknows`; non sono stati eseguiti
+sul cluster durante questo intervento. I test della pipeline usano CPU e dati
+sintetici; il benchmark locale reale riguarda solo preparazione/audit/split.
+
+### Benchmark riproducibile della preparazione
+
+```bash
+# Scegliere una directory NUOVA: conserva ogni campione, config e log dei casi.
+python scripts/benchmark_collide_preparation.py --config configs/data/collide_terabit.yaml --output-dir outputs/benchmarks/terabit_prepare_01 --workers 1 2 4 8 --repeats 1 --legacy-revision 9e1a380
+```
+
+Il comando legge gli stessi file locali in ogni caso, seleziona gli stessi eventi,
+verifica un checksum delle appartenenze scientifiche e confronta fast/strict con
+1/2/4/8 worker. `--legacy-revision` estrae il codice precedente con `git archive`
+in una directory separata, senza checkout/reset della working tree, e misura
+la vera sequenza precedente prepare + partizioni strict. Ometterlo per confrontare
+solo le policy correnti. Usare una revisione fidata compatibile con quel workflow.
+Ogni caso è un processo nuovo; non vengono scaricati dati né allenati modelli.
+
+Output: `benchmark.md`, `benchmark.csv`, `benchmark.json`, config/campioni per
+caso e log `.out`/`.err`. È necessario spazio per tutti gli export; non si
+cancellano automaticamente dati per liberarlo. Eseguire il benchmark su un nodo
+CPU allocato (almeno 8 CPU per provare 8 worker), non sul login node. Il job di
+preparazione sopra può essere adattato sostituendo il comando Python con questo
+benchmark e dimensionando RAM, CPU e wall time. Le cache non sono svuotate:
+repliche e ordine di esecuzione influenzano le misure.
+
+[Misure effettive e limiti](docs/preparation_benchmark.md): 20 file sintetici e
+un piccolo re-export di due file COLLIDE reali locali. Il target 10× non è stato
+raggiunto in queste prove; le misure non rappresentano il pilot CNAF di 100.000
+eventi né prestazioni scientifiche del modello.
+
 ### Manifest, provenienza e riutilizzo
 
 Il risultato contiene:
@@ -281,6 +441,8 @@ data/processed/collide_pilot/
   sample_manifest.json
   preparation_config.json
   validation.json
+  partitions.json       # se partitions.enabled: true (default)
+  performance.json
   tt0123j_5f_ckm_LO_MLM_semiLeptonic/part-00000.parquet
   WJetsToLNu_13TeV-madgraphMLM-pythia8/part-00000.parquet
 ```
@@ -288,7 +450,8 @@ data/processed/collide_pilot/
 Viene scritto uno shard per file originale che contribuisce righe, mantenendo
 anche differenze di schema/metadati tra file. Il manifest registra sorgente,
 commit HF quando disponibile, processi, file logici e locali, dimensioni,
-conteggi originali/esportati, row group, SHA256 e metadati originali codificati
+conteggi originali/esportati, row group, digest originali necessari all’identità,
+policy di integrità e metadati originali codificati
 in base64. `validation.json` contiene i controlli completi FullReco e L1T.
 
 Ogni riga contiene le colonne `__flowyforge_origin_source`,
@@ -313,8 +476,9 @@ dopo l'avvio viene conservato un manifest con `status: failed` e la diagnostica;
 non usare quel campione per il training. Scegliere una nuova directory per
 riprovare; gli originali HF verificati possono essere riutilizzati. Solo
 `status: complete` indica che entrambe le viste hanno superato i controlli.
-Lo stadio `inspect` è in sola lettura: usa il manifest salvato, verifica SHA256
-degli export e rilegge entrambe le viste, senza rete o accesso agli originali.
+Lo stadio `inspect` è in sola lettura: usa il manifest salvato, controlla metadati
+in fast o SHA256 in strict e rilegge entrambe le viste, senza rete o accesso agli
+originali. I manifest di campioni precedenti senza policy restano strict.
 
 ### Ispezionare il pilot con la pipeline esistente
 
@@ -357,8 +521,9 @@ il percorso locale è coperto anche da test sintetici senza rete.
 
 ## Partizioni condivise fra FullReco, L1T e fasi di apprendimento
 
-La preparazione del campione e la divisione in split sono due operazioni distinte.
-`sample_manifest.json` descrive l'export del passo precedente; `partitions.json`
+La preparazione crea per default anche gli split, con lo stesso algoritmo
+condiviso dal runner. I due artefatti restano distinti:
+`sample_manifest.json` descrive l'export; `partitions.json`
 salva **quale evento appartiene a quale split**, senza vista, limiti degli oggetti,
 unità o parametri del modello. `dataset_manifest.json` associa queste appartenenze
 ai file attualmente accessibili e al reader di un singolo run. Le trasformazioni
@@ -370,10 +535,26 @@ Preparare prima il campione con uno dei comandi HF/locali descritti sopra.
 Controllare `sources.small.processes` in `configs/runs/collide_pilot.yaml`:
 i nomi dei processi devono corrispondere alla provenienza nelle righe esportate.
 Il pilot usa `max_events_per_class: null`, quindi tutti i 5.000 eventi esportati
-per processo. Poi eseguire dalla radice, nella venv:
+per processo. Con i nuovi export `partitions.json` è già presente: riusarlo.
+Per un export completato prima di questo aggiornamento, senza partizioni:
 
 ```text
-python scripts/run_classification.py --config configs/runs/collide_pilot.yaml --stage partitions --partition-manifest data/processed/collide_pilot/partitions.json
+python scripts/prepare_collide_source.py --config configs/data/collide_pilot_local.yaml --stage partitions
+```
+
+Questo stadio legge il campione sotto `output_dir`, non gli originali indicati in
+`source`; basta che i nomi dei processi coincidano. Vale anche per un export HF.
+Non ripete download, export o audit fisico completo; in fast legge soltanto
+footer e colonne di provenienza. Usa tutti gli eventi dell'export completato,
+`selection.seed` e le frazioni di `partitions`, senza applicare di nuovo il cap.
+Un `partitions.json` esistente causa errore e rimane intatto.
+
+Resta disponibile l'entrypoint storico **strict v1**, anche su Parquet non preparati.
+Scegliere un nome nuovo se esistono già partizioni fast e verificare i percorsi
+`sources` del config (la checkout può essere configurata per TERABIT):
+
+```text
+python scripts/run_classification.py --config configs/runs/collide_pilot.yaml --stage partitions --partition-manifest data/processed/collide_pilot/partitions_strict.json
 ```
 
 Il comando non allena e non scarica dati. Rifiuta di sovrascrivere il manifest:
@@ -413,9 +594,10 @@ python scripts/run_classification.py --config configs/runs/collide_pilot.yaml --
 
 Questi due comandi verificano il reader nelle due viste e non avviano training.
 Le identità degli eventi train/validation/test sono identiche anche se cambiano
-vista, ordinamento fisico delle righe o limiti degli oggetti. Il codice rifiuta
-eventi duplicati per identità, processi diversi, righe aggiunte/rimosse e contenuti
-o schemi incompatibili. Un nuovo export deve conservare **tutto l'insieme di righe
+vista o limiti degli oggetti. Strict ammette anche righe riscritte/riordinate
+con contenuto identico; fast richiede file e metadati conservati. Entrambi
+rifiutano identità duplicate, processi diversi, righe aggiunte/rimosse e schemi
+incompatibili; solo strict verifica tutti i contenuti. Un nuovo export deve conservare **tutto l'insieme di righe
 inventariato**, comprese quelle escluse da un eventuale cap.
 
 Quando si intende allenare, gli stessi split si usano così:
@@ -448,7 +630,7 @@ Le colonne `__flowyforge_origin_*` del passo 1 preservano l'identità anche in
 export successivi. `EventBatch.metadata` espone `event_id`, `origin` e la
 posizione fisica attuale; le colonne di provenienza non entrano nelle feature.
 Un export che perde tali colonne non può preservare l'identità dopo una
-riscrittura dei file. I checksum delle righe comprendono **tutte le colonne raw,
+riscrittura dei file. In strict, i checksum delle righe comprendono **tutte le colonne raw,
 tipi e metadati dello schema Arrow**, escludendo soltanto le colonne riservate di provenienza:
 FullReco e L1T sono controllati insieme, prima delle trasformazioni del reader.
 
@@ -462,18 +644,21 @@ python scripts/run_classification.py --stage evaluate --checkpoint outputs/perce
 ```
 
 Sostituire il percorso con quello reale, anche `C:/dati/collide_pilot` su Windows.
-La radice deve contenere i processi del run. La verifica accetta file copiati
-identici o riscritti/riordinati con provenienza, valori, schema Arrow e relativi metadati
-conservati; nessun cambiamento delle appartenenze è consentito.
+La radice deve contenere i processi del run. Fast richiede anche la conservazione
+dei timestamp (es. `cp -p`, `rsync -t`, `shutil.copy2`); non considera una
+riscrittura equivalente. Strict accetta file copiati identici o riscritti/riordinati
+con provenienza, valori, schema Arrow e relativi metadati conservati. Nessun
+cambiamento delle appartenenze è consentito.
 
-La creazione legge tutti i file raw e calcola checksum, con batch di massimo
-quattro righe nella CLI. Il manifest mantiene un record per evento: spazio e
-memoria **O(numero di eventi)**, anche con cap. È una scelta esplicita per il
-pilot portabile. Il riuso verifica SHA256 dei file; per file identici riusa i
-fingerprint delle righe, mentre gli export riscritti vengono riletti interamente.
-Il reader ricontrolla il checksum di ciascun file utilizzato per iterazione/worker.
-Questi controlli possono costare I/O su EOS: questo passo non introduce un indice
-distribuito per l'intero dataset. Gli oggetti trasformati restano in streaming.
+La CLI storica usa `data.read_batch_size` (default del runner 128, impostato a
+2048 nel config `collide_pilot.yaml`), senza un
+limite forzato di quattro eventi. I manifest mantengono un record di identità per
+evento: memoria e spazio **O(numero di eventi)**, anche con cap. Oggetti e valori
+fisici restano in batch limitati; nessun tensore dell'intero dataset è conservato.
+Strict verifica SHA256 dei file al binding, riusa i fingerprint per file identici
+e rilegge quelli riscritti. Il reader strict ricontrolla SHA256 per file usato e
+iterazione/worker. Fast evita questi hash dei payload: controlla metadati, schema,
+identità e appartenenze. Hash di checkpoint, score e manifest restano attivi.
 
 ### Accesso per pretraining e selezione del checkpoint
 

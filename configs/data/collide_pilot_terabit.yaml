@@ -1,0 +1,16 @@
+# Replace these with readable local/mounted EOS files, directories or globs.
+source:
+  kind: local
+  processes:
+    tt0123j_5f_ckm_LO_MLM_semiLeptonic:
+      - /storage-hpc/kamiknows/flowyforge_data/collide2v/tt0123j_5f_ckm_LO_MLM_semiLeptonic/tt0123j_5f_ckm_LO_MLM_semiLeptonic-NEVENT10000-RS30000005.parquet
+    WJetsToLNu_13TeV-madgraphMLM-pythia8:
+      - /storage-hpc/kamiknows/flowyforge_data/collide2v/WJetsToLNu_13TeV-madgraphMLM-pythia8/WJetsToLNu_13TeV-madgraphMLM-pythia8-NEVENT10000-RS44000011.parquet
+output_dir: data/processed/collide_pilot
+selection:
+  events_per_process: 5000
+  seed: 42
+  read_batch_size: 64
+model_config: ../models/foundation_tiny.yaml
+reader:
+  units: {momentum: GeV, angle: rad}

@@ -109,7 +109,7 @@ def main() -> int:
                     raise FileExistsError(f"Refusing to overwrite existing partitions: {target}. Reuse them or choose a new path.")
                 partitions = create_partition_manifest(config["source"], seed=config["seed"],
                     validation_fraction=config["data"]["validation_fraction"],
-                    test_fraction=config["data"]["test_fraction"], read_batch_size=min(4, config["data"]["read_batch_size"]))
+                    test_fraction=config["data"]["test_fraction"], read_batch_size=config["data"]["read_batch_size"])
                 save_partition_manifest(partitions, target)
                 print(f"Partitions: {target}; counts: {partitions['split_counts']}; SHA256: {partitions['sha256']}")
                 return 0

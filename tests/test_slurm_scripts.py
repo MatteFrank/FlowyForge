@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 
@@ -74,6 +75,58 @@ def test_defaults_without_extra_arguments(cluster):
     assert args[-2:] == ["--device", "cpu"]
 
 
+@pytest.mark.parametrize("selection", ["cli", "environment", "default"])
+@pytest.mark.parametrize("runner,index,view", [("classification", "0", "FullReco"), ("pretraining", "1", "L1T")])
+def test_python_selection_precedence_and_all_invocations(cluster, tmp_path, selection, runner, index, view):
+    _, output, env, _ = cluster
+    # Isolate the default venv from the developer's real checkout/environment.
+    repo = tmp_path / "checkout with spaces"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "scripts/run_classification.py").touch()
+    env.update(FLOWYFORGE_REPO=str(repo), SLURM_ARRAY_TASK_ID=index)
+    env.pop("FLOWYFORGE_PYTHON")
+    selected = repo / ".venv/bin/python" if selection == "default" else tmp_path / f"{selection} venv/bin/python"
+    selected.parent.mkdir(parents=True)
+    calls = tmp_path / "python calls.txt"
+    selected.write_text("#!/bin/bash\n" +
+                        f"printf '%s\\n' \"$1\" >> {shlex.quote(str(calls))}\n" +
+                        f"exec {shlex.quote(sys.executable)} \"$@\"\n")
+    selected.chmod(0o755)
+    extra = ["--epochs", "2"]
+    if selection == "cli":
+        # An invalid environment default must not be checked before the override.
+        env["FLOWYFORGE_PYTHON"] = str(tmp_path / "missing environment python")
+        extra += ["--python", str(selected)]
+    elif selection == "environment":
+        env["FLOWYFORGE_PYTHON"] = str(selected)
+    extra += ["--num-workers", "0"]
+    result = launch(cluster, runner, extra)
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = json.loads(Path(env["CAPTURE"]).read_text())["args"]
+    assert args[:3] == [str(selected), "-u", f"scripts/run_{runner}.py"]
+    assert "--python" not in args
+    assert args[args.index("--epochs") + 1] == "2"
+    assert args[args.index("--num-workers") + 1] == "0"
+    assert args[args.index("--view") + 1] == view
+    assert args[args.index("--output-dir") + 1] == str(output / view.lower())
+    assert calls.read_text().splitlines() == ["-", "--version"]  # Preflight and version use the same interpreter.
+    log = (output / view.lower() / f"slurm/123_{index}/run.txt").read_text()
+    assert f"python={selected}\n" in log and f"python={selected}\n" in result.stdout
+
+
+@pytest.mark.parametrize("kind", ["missing_value", "missing_file", "not_executable", "empty"])
+def test_invalid_python_override_never_starts_training(cluster, tmp_path, kind):
+    selected = tmp_path / "invalid python"
+    if kind == "not_executable":
+        selected.write_text("#!/bin/bash\nexit 0\n")
+        selected.chmod(0o644)
+    extra = ["--python"] if kind == "missing_value" else ["--python", "" if kind == "empty" else str(selected)]
+    result = launch(cluster, extra=extra)
+    assert result.returncode == 2
+    assert ("Missing value for --python" if kind == "missing_value" else "Python is not executable") in result.stderr
+    assert not Path(cluster[2]["CAPTURE"]).exists()
+
+
 @pytest.mark.parametrize("runner,checkpoint", [("classification", "last_checkpoint.pt"), ("pretraining", "checkpoint.pt")])
 def test_explicit_resume_and_failure_exit_preserved(cluster, runner, checkpoint):
     _, output, env, _ = cluster
@@ -111,7 +164,8 @@ def test_real_cpu_runner_through_batch_wrapper(cluster, runner, stage, index):
         raw = yaml.safe_load(config.read_text())
         raw.pop("pretraining")
         config.write_text(yaml.safe_dump(raw))
-    result = launch(cluster, runner, ["--stage", stage], EXECUTE="1", SLURM_ARRAY_TASK_ID=index)
+    result = launch(cluster, runner, ["--stage", stage, "--python", sys.executable], EXECUTE="1",
+                    SLURM_ARRAY_TASK_ID=index, FLOWYFORGE_PYTHON="/missing/default/python")
     assert result.returncode == 0, result.stdout + result.stderr
     directory = output / ("fullreco" if index == "0" else "l1t")
     assert (directory / "computation_stats.md").exists()

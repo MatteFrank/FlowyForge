@@ -36,7 +36,7 @@
 # Fail on missing variables/failed commands, including commands in pipelines.
 set -euo pipefail
 if (( $# < 4 )); then
-    echo "Usage: sbatch [Slurm options] scripts/slurm/run.sbatch classification|pretraining CONFIG OUTPUT_ROOT cpu|cuda [runner options]" >&2
+    echo "Usage: sbatch [Slurm options] scripts/slurm/run.sbatch classification|pretraining CONFIG OUTPUT_ROOT cpu|cuda [--python PATH] [runner options]" >&2
     exit 2
 fi
 : "${SLURM_JOB_ID:?Submit with sbatch; do not train on the login node}"
@@ -86,7 +86,6 @@ printf 'started_utc=%s\njob=%s\nnode=%s\nrunner=%s\nview=%s\ndevice=%s\noutput=%
 # No module names are guessed and no packages/downloads are installed in a job.
 if [[ -n ${FLOWYFORGE_SETUP:-} ]]; then source "$FLOWYFORGE_SETUP"; fi
 python_bin=${FLOWYFORGE_PYTHON:-"$PWD/.venv/bin/python"}
-[[ -x "$python_bin" ]] || { echo "Set FLOWYFORGE_PYTHON to the cluster venv Python executable." >&2; exit 2; }
 
 # Pass supported options as Bash array elements (no eval, safe paths with spaces).
 # View/device/output/resume are controlled here to prevent array jobs colliding.
@@ -97,6 +96,8 @@ while (( $# )); do
     (( $# >= 2 )) || { echo "Missing value for $1" >&2; exit 2; }
     option=$1; value=$2; shift 2
     case "$option" in
+        # Wrapper-only override: never forward this option to either Python CLI.
+        --python) python_bin=$value; continue;;
         --epochs|--batch-size|--seed|--partition-manifest|--data-root|--mode|--model-config|--process|--process-name|--max-events-per-class|--downstream-mode) ;;
         --num-workers) worker_override=$value;;
         --stage) stage=$value; [[ $stage == train || $stage == inspect ]] || { echo "Only train/inspect are supported." >&2; exit 2; };;
@@ -105,6 +106,11 @@ while (( $# )); do
     esac
     extra+=("$option" "$value")
 done
+
+# Resolve precedence before validation: CLI > environment > repository venv.
+# Log even an invalid selection, so setup failures identify the attempted path.
+printf 'python=%s\n' "$python_bin" | tee -a "$job_log"
+[[ -x "$python_bin" ]] || { echo "Python is not executable: $python_bin. Use --python PATH or FLOWYFORGE_PYTHON." >&2; exit 2; }
 
 # Respect training.cpu_threads from the EXISTING YAML; OMP alone cannot override
 # torch.set_num_threads in the runner. Reject an undersized allocation. Worker

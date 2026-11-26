@@ -1857,10 +1857,41 @@ un array è in coda o in esecuzione: il batch riusa i file del filesystem condiv
 ### Interfaccia e risorse
 
 ```text
-sbatch [opzioni Slurm] scripts/slurm/run.sbatch classification|pretraining CONFIG OUTPUT_ROOT cpu|cuda [opzioni runner]
+sbatch [opzioni Slurm] scripts/slurm/run.sbatch classification|pretraining CONFIG OUTPUT_ROOT cpu|cuda [--python PATH] [opzioni runner]
 ```
 
 Le opzioni Slurm precedono il file `.sbatch`; quelle del runner lo seguono.
+`--python PATH` è un'opzione del wrapper: va dopo i quattro argomenti posizionali
+e non viene inoltrata ai runner. La scelta dell'interprete segue questa precedenza:
+
+1. `--python PATH`, se specificato;
+2. `FLOWYFORGE_PYTHON`, se non vuota;
+3. `$PWD/.venv/bin/python`, nella root della repository selezionata dal job.
+
+L'eseguibile viene verificato dopo il parsing: un override valido funziona anche
+se `FLOWYFORGE_PYTHON` indica un file inesistente. Un percorso esplicito non valido
+fa fallire il job senza ripiegare su un altro Python. Lo stesso interprete esegue
+preflight, controllo della versione e runner tramite `srun`; `python=...` viene
+scritto nello stdout Slurm e nel `run.txt` del job. Non serve attivare la venv.
+Usare un percorso raggiungibile dai compute node; quotarlo se contiene spazi.
+
+```bash
+# GPU: FullReco e L1T, con interprete esplicito prioritario sulla variabile ambiente.
+sbatch --partition=bare-metal-GPU --gres=gpu:1 \
+  --array=0-1%2 \
+  scripts/slurm/run.sbatch \
+  pretraining configs/runs/collide_pretraining.yaml \
+  outputs/terabit/pretraining cuda \
+  --python /percorso/venv/bin/python
+
+# Anche classification usa la stessa opzione; esempio CPU con un path quotato.
+sbatch --partition=bare-metal-nodes --array=0-1%1 \
+  scripts/slurm/run.sbatch \
+  classification configs/runs/collide_supervised.yaml \
+  outputs/terabit/reference_cpu cpu \
+  --python "/percorso con spazi/venv/bin/python"
+```
+
 I default nello script sono **1 nodo, 1 task, 6 CPU, 16 GiB RAM, 1 ora**, una
 sola vista FullReco e nessuna GPU. Sono valori iniziali modificabili tramite
 `sbatch`, non una stima validata del pilot. RAM (`--mem`) e memoria GPU sono
@@ -1959,7 +1990,7 @@ GPU. Ridurre la concorrenza se storage condiviso, quota o lettura sono il limite
 | --- | --- |
 | `outputs/slurm_logs/NOME-JOBID_INDICE.out` | Stdout del batch e del runner, senza buffering Python |
 | `outputs/slurm_logs/NOME-JOBID_INDICE.err` | Stderr, traceback, errori di `srun`/ambiente; può contenere warning anche nei run riusciti |
-| `OUTPUT_ROOT/{fullreco,l1t}/slurm/JOBID_INDICE/run.txt` | Comando quotato, vista/device, nodo, commit Git, thread/worker, orari, durata wrapper, exit code |
+| `OUTPUT_ROOT/{fullreco,l1t}/slurm/JOBID_INDICE/run.txt` | Percorso Python selezionato, comando quotato, vista/device, nodo, commit Git, thread/worker, orari, durata wrapper, exit code |
 | `OUTPUT_ROOT/{fullreco,l1t}/computation_stats.md` | Statistiche del runner dopo il completamento positivo, descritte nella sezione seguente |
 | `outputs/slurm_logs/status-JOBID-*.txt` | Snapshot di coda, accounting, risorse e dettagli prodotto da `status.sh` |
 

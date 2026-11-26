@@ -22,7 +22,7 @@ data:
   shuffle_buffer: 512
   audit_events_per_class: 32
 training:
-  epochs: 2
+  epochs: 24
   batch_size: 16
   learning_rate: 0.001
   weight_decay: 0.0001

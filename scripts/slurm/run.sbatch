@@ -23,7 +23,8 @@
 # Host RAM per node, independent of GPU VRAM; a limit, not measured usage.
 #SBATCH --mem=16G
 # Wall-clock limit, including input/output and final evaluation/report creation.
-#SBATCH --time=01:00:00
+#SBATCH --time=24:00:00
+# # SBATCH --time=INFINITE
 # One FullReco run by default. --array=0-1%2 runs both views concurrently.
 #SBATCH --array=0%1
 # %x = job name, %A = array job ID, %a = array index; no collisions between jobs.

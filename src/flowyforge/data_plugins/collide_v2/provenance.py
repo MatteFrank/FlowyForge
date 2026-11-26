@@ -44,6 +44,33 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _file_identity(path):
+    stat = Path(path).stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def verify_file(path, expected=None):
+    """Fresh cryptographic verification; the returned proof is operation-local.
+
+    A ctime/inode check is only early invalidation, never a substitute for SHA256.
+    Callers reusing this proof MUST finish the operation with another verify_file.
+    No proof is persisted in a manifest or reused across training iterations.
+    """
+    before = _file_identity(path)
+    digest = sha256_file(path)
+    if _file_identity(path) != before:
+        raise ValueError(f"File changed during SHA256 verification: {path}")
+    if expected is not None and digest != expected:
+        raise ValueError(f"File content changed during strict verification: {path}")
+    return (before, digest)
+
+
+def check_verified_file(path, proof):
+    """Cheap early rejection between initial and mandatory final cryptographic checks."""
+    if _file_identity(path) != proof[0]:
+        raise ValueError(f"File identity/metadata changed during strict audit: {path}")
+
+
 def provenance_columns(schema: pa.Schema) -> list[str]:
     """Reject incomplete/ambiguous provenance rather than replacing its origin."""
     present = {name for name in schema.names if name.startswith(PREFIX)}

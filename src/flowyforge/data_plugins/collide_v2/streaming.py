@@ -289,13 +289,88 @@ def _policy(value):
     return value
 
 
-def _event_records(table, name, *, policy, digest=None, row_start=0, timing=None):
+def _numeric_tree(dtype):
+    """Only trees whose hidden/null children are safe to box unconditionally."""
+    if pa.types.is_integer(dtype) or pa.types.is_floating(dtype):
+        return True
+    if pa.types.is_list(dtype) or pa.types.is_large_list(dtype) or pa.types.is_fixed_size_list(dtype):
+        return _numeric_tree(dtype.value_type)
+    if pa.types.is_struct(dtype):
+        return len(set(dtype.names)) == len(dtype) and all(_numeric_tree(field.type) for field in dtype)
+    return False
+
+
+def _arrow_values(array):
+    """Exact JSON-equivalent values for numerical Arrow trees, bounded by batch.
+
+    NumPy boxes primitive buffers in native code; offsets reconstruct only the
+    referenced child slice. No float coercion of nullable int64/uint64. Everything
+    outside this small type whitelist keeps Arrow's original scalar conversion.
+    """
+    if isinstance(array, pa.ChunkedArray):
+        return [value for chunk in array.chunks for value in _arrow_values(chunk)]
+    dtype = array.type
+    if not len(array):
+        return []
+    if not _numeric_tree(dtype):
+        # Fall back for the WHOLE container: converting hidden temporal/extension
+        # children beneath a null parent could fail where Arrow correctly skips them.
+        return array.to_pylist()
+    nulls = np.flatnonzero(array.is_null().to_numpy(zero_copy_only=False)) if array.null_count else ()
+    if pa.types.is_integer(dtype) or pa.types.is_floating(dtype):
+        # Primitive Arrow buffers have a fixed-width numeric layout. Reading the
+        # validity bitmap separately avoids Arrow->NumPy null promotion to float.
+        numpy_type = np.dtype(dtype.to_pandas_dtype()).newbyteorder("<")
+        values = np.frombuffer(array.buffers()[1], dtype=numpy_type, count=len(array),
+                               offset=array.offset * numpy_type.itemsize).tolist()
+    elif pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
+        offsets = array.offsets.to_numpy()
+        first, last = int(offsets[0]), int(offsets[-1])
+        children = _arrow_values(array.values.slice(first, last - first))
+        values = [children[int(a) - first:int(b) - first] for a, b in zip(offsets[:-1], offsets[1:])]
+    elif pa.types.is_fixed_size_list(dtype):
+        size = dtype.list_size
+        children = _arrow_values(array.values.slice(array.offset * size, len(array) * size))
+        values = [children[i * size:(i + 1) * size] for i in range(len(array))]
+    elif pa.types.is_struct(dtype) and len(set(dtype.names)) == len(dtype):
+        columns = [_arrow_values(array.field(i)) for i in range(len(dtype))]
+        values = [dict(zip(dtype.names, row)) for row in zip(*columns)] if columns else [{} for _ in range(len(array))]
+    for index in nulls:
+        values[index] = None
+    return values
+
+
+def _arrow_rows(table, *, max_bytes=8 * 1024 * 1024):
+    """Box at most ~8 MiB Arrow values at once (or one oversized event).
+
+    Row slices retain buffers without copying. Check each slice's actual nbytes
+    too, so skewed object multiplicities cannot defeat the average-size estimate.
+    This bounds Python expansion independently of the configurable Arrow batch.
+    """
+    if not table.num_rows:
+        return
+    count = max(1, min(table.num_rows, max_bytes * table.num_rows // max(1, table.nbytes)))
+    for start in range(0, table.num_rows, count):
+        piece = table.slice(start, count)
+        if piece.num_rows > 1 and piece.nbytes > max_bytes:
+            yield from _arrow_rows(piece, max_bytes=max_bytes)
+        elif piece.nbytes <= 64 * 1024 or len(set(piece.column_names)) != len(piece.column_names):
+            # Native buffer setup costs more than it saves on tiny batches.
+            # Also preserve Arrow's duplicate-name behaviour exactly.
+            yield from piece.to_pylist()
+        else:
+            columns = [_arrow_values(column) for column in piece.columns]
+            for index in range(piece.num_rows):
+                yield {name: column[index] for name, column in zip(piece.column_names, columns)}
+
+
+def _event_records(table, name, *, policy, digest=None, row_start=0, timing=None, signature=None):
     """Common export/scan records; fast projects origins BEFORE Python conversion."""
     origins = provenance_columns(table.schema)
-    signature = _schema_digest(table.schema) if policy == "strict" else None
-    rows = table if policy == "strict" else table.select(origins)
+    signature = (signature or _schema_digest(table.schema)) if policy == "strict" else None
+    rows = _arrow_rows(table) if policy == "strict" else table.select(origins).to_pylist()
     records = []
-    for index, row in enumerate(rows.to_pylist()):
+    for index, row in enumerate(rows):
         origin = pop_origin(row) or {"source": "local", "revision": None,
             "process": name, "file": "sha256:" + digest, "row": row_start + index, "sha256": digest}
         if origin["process"] != name:
@@ -343,7 +418,7 @@ def _scan_partition_file(job):
                                               columns=None if policy == "strict" else origins):
                 # Zero-column Arrow batches preserve the row count for raw fast sources.
                 records.extend(_event_records(pa.Table.from_batches([batch]), name, policy=policy,
-                                              digest=digest, row_start=row_start, timing=timing))
+                                              digest=digest, row_start=row_start, timing=timing, signature=schema_digest))
                 row_start += len(batch)
         if len(records) != parquet.metadata.num_rows:
             raise ValueError(f"Cached partition row count differs: {path}")

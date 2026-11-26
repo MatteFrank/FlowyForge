@@ -21,7 +21,7 @@ from flowyforge.core.parallel import map_files, peak_rss_bytes
 from flowyforge.data_plugins.collide_v2.hf_collide1m import (
     _safe_process_name, download_hf_files, plan_hf_files,
 )
-from flowyforge.data_plugins.collide_v2.provenance import ORIGIN_COLUMNS, provenance_columns, sha256_file, with_origin
+from flowyforge.data_plugins.collide_v2.provenance import ORIGIN_COLUMNS, provenance_columns, sha256_file, with_origin, verify_file, check_verified_file
 from flowyforge.data_plugins.collide_v2.streaming import (
     _check_file, _reader_config, _resolve_processes, _schema_info, _schema_digest, _event_records,
     build_manifest, inspect_dataset, create_partition_manifest, save_partition_manifest, _policy, _audit_warnings, _split_counts,
@@ -144,6 +144,7 @@ def _export_file(info: dict, selected: list[int] | None, destination: Path, orig
     _check_file(info)
     try:
         with pq.ParquetFile(info["path"]) as parquet:
+            signature = _schema_digest(parquet.schema_arrow) if collect and policy == "strict" else None
             for group in range(parquet.num_row_groups):
                 group_size = parquet.metadata.row_group(group).num_rows
                 if chosen is not None and bisect.bisect_left(chosen, start + row_start) == bisect.bisect_left(chosen, start + row_start + group_size):
@@ -159,7 +160,7 @@ def _export_file(info: dict, selected: list[int] | None, destination: Path, orig
                         table = with_origin(table, origin, indices)
                         if collect:
                             collection_started = time.perf_counter()
-                            records.extend(_event_records(table, origin["process"], policy=policy, timing=timing))
+                            records.extend(_event_records(table, origin["process"], policy=policy, timing=timing, signature=signature))
                             if timing is not None:
                                 timing["partition_collection_seconds"] += time.perf_counter() - collection_started
                         if writer is None:
@@ -185,7 +186,14 @@ def _export_file(info: dict, selected: list[int] | None, destination: Path, orig
 
 def _validate_file(job):
     """Full existing reader audit for one file, in one worker and bounded batches."""
-    path, name, readers, read_batch_size, checksum = job
+    path, name, readers, read_batch_size, checksum, *proofs = job
+    proof = proofs[0] if proofs else None
+    if checksum is not None:
+        if proof is None:
+            proof = verify_file(path, checksum)
+        elif proof[1] != checksum:
+            raise ValueError("Strict audit proof differs from expected checksum.")
+        check_verified_file(path, proof)
     path = Path(path)
     stat = path.stat()
     reports = {}
@@ -195,12 +203,18 @@ def _validate_file(job):
             info = {"path": str(path), "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns,
                     "num_rows": parquet.metadata.num_rows, "offset": 0, "task_offset": 0,
                     "row_groups": groups, **_schema_info(parquet.schema_arrow, reader, path)}
+            # Both views share the operation's initial verification. Metadata
+            # guards are early checks; a mandatory final SHA detects even same-stat
+            # content changes. Never place this temporary proof in the binding.
             if checksum is not None:
-                info["sha256"] = checksum
+                check_verified_file(path, proof)
             process = {"name": name, "label": 0, "files": [info], "num_rows": info["num_rows"],
                        "selected_rows": info["num_rows"], "selected_indices": None}
             reports[view] = inspect_dataset({"seed": 0, "reader": reader, "processes": [process], "split_counts": {}},
                 audit_events_per_class=max(1, info["num_rows"]), read_batch_size=read_batch_size)
+    if checksum is not None:
+        check_verified_file(path, proof)
+        verify_file(path, checksum)
     return reports
 
 
@@ -240,7 +254,7 @@ def _merge_reports(parts, manifest):
     return result
 
 
-def _prepared_files(output, manifest, policy):
+def _prepared_files(output, manifest, policy, *, verify_payload=True):
     """Validate completed inventory/footer metadata; fast never hashes payloads."""
     processes = {name: [] for name in manifest["processes"]}
     counts = dict.fromkeys(processes, 0)
@@ -253,7 +267,7 @@ def _prepared_files(output, manifest, policy):
         stat = path.stat()
         if stat.st_size != entry["size_bytes"]:
             raise ValueError(f"Prepared file changed: {path}")
-        if policy == "strict" and entry.get("sha256") and sha256_file(path) != entry["sha256"]:
+        if verify_payload and policy == "strict" and entry.get("sha256") and sha256_file(path) != entry["sha256"]:
             raise ValueError(f"Prepared file changed: {path}")
         if policy == "fast" and "mtime_ns" in entry and stat.st_mtime_ns != entry["mtime_ns"]:
             raise ValueError(f"Prepared file changed (mtime): {path}")
@@ -281,7 +295,7 @@ def inspect_prepared_sample(output_dir: str | Path) -> dict:
     output = Path(output_dir).expanduser().resolve()
     manifest = _completed_sample(output)
     policy = manifest.get("check_integrity_SHA256", "strict")
-    _prepared_files(output, manifest, policy)
+    _prepared_files(output, manifest, policy, verify_payload=False)
     jobs = [(str(output / f["path"]), f["process"], manifest["readers"],
              manifest["selection"]["read_batch_size"], f.get("sha256") if policy == "strict" else None)
             for f in manifest["output_files"]]
@@ -364,12 +378,14 @@ def _prepare_file(job):
         entry = {"process": description["process"], "path": destination.name,
                  "input_file": description["logical_file"], "num_rows": count,
                  "size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "schema_sha256": signature}
+        proof = None
         if policy == "strict":
             started = time.perf_counter()
-            entry["sha256"] = sha256_file(destination)
+            proof = verify_file(destination)
+            entry["sha256"] = proof[1]
             timing["output_sha256_seconds"] = time.perf_counter() - started
         started = time.perf_counter()
-        reports = _validate_file((str(destination), description["process"], readers, read_batch_size, entry.get("sha256")))
+        reports = _validate_file((str(destination), description["process"], readers, read_batch_size, entry.get("sha256"), proof))
         timing["parquet_validation_seconds"] = time.perf_counter() - started
         _check_file(info)
         if destination.stat().st_mtime_ns != stat.st_mtime_ns:

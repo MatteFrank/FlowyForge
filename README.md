@@ -341,6 +341,54 @@ picco simultaneo dell'intero job. Lo stadio separato produce
 `partition_performance.json`. Ridurre `selection.read_batch_size` o i worker
 se i grandi eventi nested consumano troppa RAM; il default di export rimane 64.
 
+In **strict**, la conversione delle colonne numeriche nested usa i buffer Arrow
+e NumPy, conservando gli stessi valori e gli stessi byte JSON canonici del reader
+originale. Gli altri tipi mantengono la conversione Arrow originale. Lo schema
+viene fingerprintato una volta per file; le colonne di provenienza restano escluse
+dal fingerprint dei valori raw. Non cambiano ID, split, versioni dei manifest o
+contratti dei checkpoint. Anche un vecchio manifest strict rimane valido.
+Per porzioni fino a 64 KiB resta `to_pylist()`: evita il costo di inizializzazione
+del percorso numerico sui batch molto piccoli.
+
+L'espansione in oggetti Python è suddivisa in porzioni da circa **8 MiB di valori
+Arrow**, salvo un singolo evento più grande. Non è un limite alla RAM totale:
+rimangono il batch Arrow configurato, l'overhead Python e l'inventario degli ID.
+Nell'audit FullReco/L1T di un export strict si condividono il primo hash e i
+controlli di identità del file; un **secondo hash completo obbligatorio** chiude
+l'operazione. Non esiste una cache persistente basata su dimensione/mtime, né si
+riusano queste verifiche fra epoche di training. Come prima, i file devono restare
+stabili durante una lettura; non viene creata una snapshot del filesystem.
+
+Per **20 file su HPC**, partire da `selection.read_batch_size: 64`,
+`partitions.read_batch_size: 64` in strict e `partitions.num_workers: 4`;
+confrontare poi batch 64/256 e 1/2/4/8 worker sul proprio nodo e storage.
+In fast rimane appropriato il default `partitions.read_batch_size: 2048`, perché
+la scansione separata legge solo la provenienza. Il numero di worker riguarda
+file diversi: due file non possono sfruttare otto processi. Richiedere almeno
+tante CPU quanti worker e dimensionare la memoria sui picchi misurati; su EOS
+otto lettori possono peggiorare la contesa I/O. Questi sono punti di partenza,
+non risultati misurati su CNAF.
+
+Per isolare il costo **strict delle sole partizioni**, senza riscrivere gli
+input o avviare training, il benchmark esistente accetta anche:
+
+```bash
+python scripts/benchmark_collide_preparation.py --partition-source data/processed/collide_pilot --output-dir outputs/benchmarks/strict_01 --legacy-revision 9e1a380 --task1-revision c336c07 --batch-size 64 --workers 1 2 4 8 --repeats 3
+```
+
+`--partition-source` deve contenere directory dei processi con Parquet leggibili.
+`--batch-size` vale per tutte le implementazioni confrontate. I riferimenti Git
+sono facoltativi e vengono estratti in directory nuove, senza checkout; devono
+essere disponibili nel clone. La baseline originale è seriale. Il comando
+rifiuta output già esistenti e interrompe il confronto se differisce **l'intero
+checksum del manifest strict**, non solo il numero di eventi. Salva
+`strict_benchmark.{json,csv,md}`, stdout/stderr e manifest per ogni caso, con
+wall/CPU time, byte letti/serializzati, eventi/s, RSS e tempi delle fasi. Le fasi
+native lettura/decompressione/creazione RecordBatch sono misurate insieme;
+Arrow→Python include le allocazioni nested. Cache filesystem non controllata,
+tempi inclusivi e somme dei picchi RSS richiedono le cautele descritte nelle
+[misure strict e raccomandazioni](docs/preparation_benchmark.md#ottimizzazione-strict-fingerprint-esatti).
+
 ### TERABIT/CNAF: un solo job per preparazione e split
 
 Da `ui-terabit.cr.cnaf.infn.it`, nella radice FlowyForge e con la venv già

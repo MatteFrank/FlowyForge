@@ -125,3 +125,29 @@ Worker phase totals (seconds; fingerprint time is included in partition collecti
 | strict | 2 | 0.061 | 0.718 | 7.439 | 6.369 | 0.006 | 2.450 | 2.609 | 0.018 | 0.000 |
 | strict | 4 | 0.064 | 0.732 | 7.812 | 6.445 | 0.006 | 2.496 | 2.599 | 0.021 | 0.000 |
 | strict | 8 | 0.075 | 0.774 | 7.838 | 6.246 | 0.006 | 2.431 | 2.582 | 0.021 | 0.000 |
+
+## Verifiche della pipeline
+
+`python3 -m pytest tests/ -q`: **173 passed**, 552 warning di deprecazione
+Matplotlib/Pillow, 197,38 s nella suite finale. I due test inizialmente falliti
+fallivano anche sul codice originale `9e1a380`: assumevano ancora uguali epoche
+default supervised/downstream e il vecchio percorso del config pilot. Sono stati
+aggiornati alle configurazioni presenti, senza cambiare i parametri scientifici.
+
+Gli smoke sintetici coprono entrambe le policy, FullReco/L1T, pretraining di una
+sola epoca CPU, export encoder, scratch/linear probe/fine-tuning, report di
+confronto, resume fast, appartenenze uguali, test escluso dal pretraining e uso
+finale del test downstream. I test controllano inoltre assenza di hashing dei
+payload fast, protezioni strict, proiezione delle sole colonne di provenienza,
+worker 1/2/4/8, audit aggregato e cleanup dopo errore del worker.
+
+Verifica reale aggiuntiva, senza training: una copia dell'export legacy del
+benchmark (128 eventi totali) è stata usata con `--stage partitions` fast,
+2 worker. Il nuovo manifest ha split **80/24/24**, identità/etichette/appartenenze
+esattamente uguali al manifest strict precedente e SHA del manifest distinto.
+Due `run_classification.py --stage inspect --device cpu` hanno letto FullReco e
+L1T, 64 eventi di audit per vista. Avvisi attesi: unità assunte, PUPPIPart
+troncate dal reader e Charge opzionale mancante per Electron/MuonTight.
+Artefatti locali: `outputs/preparation_existing_sample_smoke/`,
+`outputs/preparation_inspect_fullreco/`, `outputs/preparation_inspect_l1t/`.
+Il campione originale sotto `data/processed/collide_pilot` è rimasto intatto.

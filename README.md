@@ -693,7 +693,8 @@ Senza `partition_manifest` tutti i comandi precedenti conservano il manifest del
 dataset **versione 1**, con split impliciti e percorsi congelati. I checkpoint
 esistenti continuano a essere valutabili; `--data-root` in valutazione richiede
 invece la versione 2. Il manifest separato delle partizioni ha un proprio tipo
-`flowyforge.event_partitions` e versione 1: non va confuso con quello del dataset.
+`flowyforge.event_partitions`: versione 1 strict oppure versione 2 fast,
+da non confondere con le versioni del binding/dataset.
 Versioni sconosciute, checksum errati o inventari incompatibili causano errori
 espliciti. Non avviene conversione automatica: l'ordinamento per identità può
 produrre split diversi da quelli di un vecchio run, anche con lo stesso seed.
@@ -1592,7 +1593,8 @@ se quest'ultimo manca, restituisce un errore. `--checkpoint` rimane invece
 riservato alla valutazione.
 
 Il resume verifica prima di modificare gli output: modalità/testa/freezing,
-contratto delle feature e architettura, etichette, inventario e SHA256 dei dati,
+contratto delle feature e architettura, etichette, inventario, integrità dei dati
+secondo la policy salvata (SHA256 in legacy/strict, metadati e identità in fast),
 partizioni correnti e salvate, protocollo, integrità dello stato, history,
 optimizer e RNG. È consentito cambiare solo il totale di epoche fra i parametri
 del run; anche batch size, worker, seed, device, shuffle buffer e thread devono
